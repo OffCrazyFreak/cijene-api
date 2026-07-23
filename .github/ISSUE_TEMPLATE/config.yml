@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Upstream project (start here)
+    url: https://github.com/senko/cijene-api/issues
+    about: This is a fork. Crawler, data and API issues belong upstream, where the fix reaches everyone.
+  - name: Security vulnerability
+    url: https://github.com/OffCrazyFreak/cijene-api/security/policy
+    about: Please report security issues privately, not as a public issue.
+  - name: Hosted API
+    url: https://api.cijene.dev/docs
+    about: OpenAPI docs for the live service.

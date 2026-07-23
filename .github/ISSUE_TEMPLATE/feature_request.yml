@@ -1,0 +1,84 @@
+name: Feature request
+description: Suggest an endpoint, filter, or data addition
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Most feature requests belong upstream**, at
+        [senko/cijene-api](https://github.com/senko/cijene-api/issues), because
+        that is where the change would be built. Use this form only for something
+        specific to this fork.
+
+        Please search existing issues in both repos first to avoid duplicates.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: >-
+        What can a consumer of the API not do today? Describe the need, not the
+        implementation.
+      placeholder: >-
+        There is no way to ask for a product's price over a date range, so a
+        history chart needs one request per day.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: >-
+        What you would like to happen. Leave blank if you are not sure how it
+        should work, describing the problem above is enough.
+    validations:
+      required: false
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Domain
+      description: Matches the Domain field on the roadmap board.
+      options:
+        - 🕷 Chain Crawlers
+        - 🧹 Data Quality
+        - 🏪 Stores & Locations
+        - 🏷 Product Data
+        - 📉 Prices & Discounts
+        - 🔎 Search & Matching
+        - 🔌 API & Auth
+        - 🗄 Database & Storage
+        - 🚀 Platform & Delivery
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: >-
+        How consumers cope today, and what it costs. This is often the strongest
+        argument for the change.
+      placeholder: "e.g. 30 requests per product per chart, cached for a day"
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any other approaches you thought about.
+    validations:
+      required: false
+  - type: input
+    id: blocked_on
+    attributes:
+      label: Blocked on
+      description: Anything that has to land first, including work outside this repo.
+      placeholder: "e.g. waiting on category data to exist at all"
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Example requests and responses, links, or anything else that helps.
+    validations:
+      required: false

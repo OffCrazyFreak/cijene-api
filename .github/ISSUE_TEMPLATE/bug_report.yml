@@ -1,0 +1,98 @@
+name: Bug report
+description: Report a crawler, data, or API problem
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Most bugs belong upstream.** If the problem is in the service or a
+        crawler, file it at
+        [senko/cijene-api](https://github.com/senko/cijene-api/issues) so the fix
+        reaches everyone. Use this form only for something specific to this fork.
+
+        Please search existing issues first, in both repos, to avoid duplicates.
+
+        Only the description is required. A one-line report is welcome and we can
+        ask follow-up questions.
+
+        **Found a security vulnerability?** Do not file it here. See the
+        [Security Policy](https://github.com/OffCrazyFreak/cijene-api/security/policy).
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Domain
+      description: Matches the Domain field on the roadmap board.
+      options:
+        - 🕷 Chain Crawlers
+        - 🧹 Data Quality
+        - 🏪 Stores & Locations
+        - 🏷 Product Data
+        - 📉 Prices & Discounts
+        - 🔎 Search & Matching
+        - 🔌 API & Auth
+        - 🗄 Database & Storage
+        - 🚀 Platform & Delivery
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: chain
+    attributes:
+      label: Which chain
+      description: For crawler and data bugs, the retailer involved.
+      placeholder: "e.g. Lidl, Konzum, Studenac"
+    validations:
+      required: false
+  - type: input
+    id: dates
+    attributes:
+      label: Dates affected
+      description: >-
+        Price data is per-day, so a bug is usually "since date X" or "on date Y".
+      placeholder: "e.g. missing from the archives since 2026-07-14"
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        The crawl command or API request that shows the problem. (optional, but
+        it helps a lot)
+      placeholder: |
+        uv run python -m crawler.cli.crawl --chain lidl --date 2026-07-14
+        curl "https://api.cijene.dev/v1/products?q=mlijeko"
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What did you expect, and what happened instead? (optional)
+      placeholder: |
+        Now: 0 stores parsed, no error raised.
+        Expected: ~1200 stores, or a non-zero exit code.
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and whether you run it via Docker.
+      placeholder: "e.g. Windows 11, Python 3.13, uv, no Docker"
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Logs, output, or screenshots
+      description: Attach anything that helps. Paste tracebacks in full.
+    validations:
+      required: false
