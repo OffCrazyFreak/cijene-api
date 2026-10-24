@@ -30,7 +30,7 @@ class StudenacCrawler(BaseCrawler):
 
     PRICE_MAP = {
         "price": ("MaloprodajnaCijena", False),
-        "unit_price": ("CijenaPoJedinici", False),
+        "unit_price": ("CijenaZaJedinicuMjere", False),
         "special_price": ("MaloprodajnaCijenaAkcija", False),
         "best_price_30": ("NajnizaCijena", False),
         "anchor_price": ("SidrenaCijena", False),
@@ -45,6 +45,25 @@ class StudenacCrawler(BaseCrawler):
         "barcode": ("Barkod", False),
         "category": ("KategorijeProizvoda", False),
     }
+
+    REQUIRED_COLUMNS = [
+        "MaloprodajnaCijena",
+        "CijenaZaJedinicuMjere",
+        "SidrenaCijena",
+        "NazivProizvoda",
+        "SifraProizvoda",
+        "MarkaProizvoda",
+        "JedinicaMjere",
+        "Barkod",
+    ]
+
+    # Not required by NN 101/2026, so the chain may drop them when it switches.
+    OPTIONAL_COLUMNS = [
+        "NetoKolicina",
+        "KategorijeProizvoda",
+        "MaloprodajnaCijenaAkcija",
+        "NajnizaCijena",
+    ]
 
     def parse_address(self, address: str) -> Tuple[str, str]:
         """
@@ -114,8 +133,11 @@ class StudenacCrawler(BaseCrawler):
             )
 
             # Extract product information
+            product_elems = root.xpath("//ProdajniObjekt/Proizvodi/Proizvod")
+            self.check_xml_columns(product_elems)
+
             products = []
-            for product_elem in root.xpath("//ProdajniObjekt/Proizvodi/Proizvod"):
+            for product_elem in product_elems:
                 try:
                     product = self.parse_xml_product(product_elem)
                     products.append(product)
@@ -162,7 +184,7 @@ class StudenacCrawler(BaseCrawler):
     def get_zip_contents(
         self, url: str, suffix: str
     ) -> Generator[tuple[str, bytes], None, None]:
-        with TemporaryDirectory() as temp_dir:  # type: ignore
+        with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             temp_zip = temp_path / "archive.zip"
             with open(temp_zip, "wb") as fp:

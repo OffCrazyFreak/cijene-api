@@ -1,6 +1,7 @@
 import datetime
 import logging
 import re
+from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
 
@@ -10,7 +11,7 @@ from .base import BaseCrawler
 
 logger = logging.getLogger(__name__)
 
-CSV_PATTERN = re.compile(r"^(Supermarket_.+)_(\d+)_\d+_(\d{8})_\d{2}_\d{2}_\d{2}\.csv$")
+CSV_PATTERN = re.compile(r"^([A-Za-z]+_.+)_(\d+)_\d+_(\d{8})_\d{2}_\d{2}_\d{2}\.csv$")
 
 
 class GavranovicCrawler(BaseCrawler):
@@ -31,7 +32,13 @@ class GavranovicCrawler(BaseCrawler):
         "unit_price": ("Cijena za jedinicu mjere", True),
         "special_price": ("MPC za vrijeme posebnog oblika prodaje", False),
         "best_price_30": ("Najniža cijena u poslj.30 dana", False),
-        "anchor_price": ("Sidrena cijena na 2.5.2025", False),
+        # Renamed on 2026-09-25 when the chain moved to the NN 101/2026 format.
+        # The values did not change with the header, so the column name says
+        # nothing reliable about which reference date a given row refers to.
+        "anchor_price": (
+            ["Sidrena cijena na 2.5.2025", "Sidrena cijena na 10.09.2026"],
+            False,
+        ),
     }
 
     FIELD_MAP = {
@@ -42,7 +49,35 @@ class GavranovicCrawler(BaseCrawler):
         "unit": ("Jedinica mjere", False),
         "barcode": ("Barkod", True),
         "category": ("Kategorija proizvoda", False),
+        "special_sale_type": ("Naziv posebnog oblika prodaje", False),
     }
+
+    BOOL_MAP = {
+        "available": ("Dostupnost", False),
+    }
+
+    REQUIRED_COLUMNS = [
+        "Maloprodajna cijena",
+        "Cijena za jedinicu mjere",
+        ["Sidrena cijena na 2.5.2025", "Sidrena cijena na 10.09.2026"],
+        "Naziv proizvoda",
+        "Šifra proizvoda",
+        "Marka proizvoda",
+        "Jedinica mjere",
+        "Barkod",
+    ]
+
+    # On 2026-09-25 the chain dropped the special price and 30-day low columns
+    # and added the sale name and availability ones. Files from either side of
+    # the switch must keep parsing, since the index keeps several days of files.
+    OPTIONAL_COLUMNS = [
+        "Neto količina",
+        "Kategorija proizvoda",
+        "MPC za vrijeme posebnog oblika prodaje",
+        "Najniža cijena u poslj.30 dana",
+        "Naziv posebnog oblika prodaje",
+        "Dostupnost",
+    ]
 
     def get_csv_urls(
         self, html: str, date: datetime.date
@@ -73,7 +108,8 @@ class GavranovicCrawler(BaseCrawler):
             name_part, store_id, file_date = m.groups()
             if file_date == date_str:
                 url = f"{self.INDEX_URL}{href}"
-                results.append((url, name_part, store_id))
+                # Some addresses carry a percent-encoded comma (%2C)
+                results.append((url, unquote(name_part), store_id))
 
         return results
 
@@ -81,7 +117,7 @@ class GavranovicCrawler(BaseCrawler):
         """
         Extract store information from the filename name part.
 
-        The name part has the format: Supermarket_{Address}_{CITY}
+        The name part has the format: {Type}_{Address}_{CITY}
         where underscores replace spaces in the address.
 
         Args:
@@ -92,18 +128,25 @@ class GavranovicCrawler(BaseCrawler):
         Returns:
             A Store object with parsed location info and no items.
         """
-        parts = name_part.split("_")
-        # Store type is the first token (e.g. "Supermarket")
+        # Drop empty tokens from doubled underscores ("Kraljevec__na_Sutli")
+        parts = [p for p in name_part.split("_") if p]
+        # Store type is the first token (e.g. "Supermarket", "Minimarket")
         store_type = parts[0]
 
         # City tokens are the trailing all-uppercase tokens (e.g. KARLOVAC,
         # or SV_KRIZ_ZACRETJE for multi-word cities). Address is in between.
+        # A single uppercase letter is a house number suffix, not part of the
+        # city ("Stubicka_349_A_DONJA_BISTRA"), and a lone "-" joins two city
+        # tokens ("SESVETE_-_KRALJEVEC").
         city_start = len(parts)
         for i in range(len(parts) - 1, 0, -1):
-            if parts[i].isupper():
+            token = parts[i]
+            if (token.isupper() and len(token) > 1) or token == "-":
                 city_start = i
             else:
                 break
+        while city_start < len(parts) and parts[city_start] == "-":
+            city_start += 1
 
         city = " ".join(parts[city_start:]).title()
         address = " ".join(parts[1:city_start])
@@ -165,6 +208,20 @@ class GavranovicCrawler(BaseCrawler):
                 continue
 
         return stores
+
+    def fix_product_data(self, data: dict) -> dict:
+        """Mirror the promotional price for the NN 101/2026 format."""
+        data = super().fix_product_data(data)
+
+        # Since 2026-09-25 the chain publishes one price column plus the name of
+        # the special form of sale, having dropped the separate special price
+        # column. When a sale name is present the published price is the
+        # promotional one, so mirror it into special_price to keep the "on sale"
+        # signal. The regular pre-promo price is no longer published.
+        if data.get("special_sale_type") and data.get("special_price") is None:
+            data["special_price"] = data.get("price")
+
+        return data
 
 
 if __name__ == "__main__":
