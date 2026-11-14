@@ -1,6 +1,8 @@
 import os
 import time
 import logging
+import unicodedata
+from urllib.parse import quote, quote_from_bytes
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -77,6 +79,24 @@ async def _lookup_user_by_token(api_key: str) -> User | None:
     return user
 
 
+def _log_field(value: str, allow_spaces: bool = False) -> str:
+    return "".join(
+        quote(char, safe="")
+        if unicodedata.category(char).startswith("C")
+        or (char.isspace() and not (allow_spaces and char == " "))
+        else char
+        for char in value
+    )
+
+
+def _request_log_path(request: Request) -> str:
+    raw_path = request.scope.get("raw_path")
+    safe = "/:@!$&'()*+,;=-._~"
+    if raw_path is not None:
+        return quote_from_bytes(raw_path, safe=safe + "%")
+    return quote(request.scope["path"], safe=safe)
+
+
 async def verify_authentication(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
@@ -105,10 +125,10 @@ async def verify_authentication(
         _key_log.info(
             "%s %s %s %s %s",
             user.id,
-            request.method,
-            request.url.path,
-            request.client.host if request.client else "-",
-            request.headers.get("user-agent", "-"),
+            _log_field(request.method),
+            _request_log_path(request),
+            _log_field(request.client.host if request.client else "-"),
+            _log_field(request.headers.get("user-agent", "-"), allow_spaces=True),
         )
     return user
 
