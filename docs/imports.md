@@ -18,7 +18,7 @@ Named internal constants currently allow 100 chain directories, 2 GiB per CSV an
 
 The crawler's root-level `archive-info.txt` notice is accepted as a bounded regular file and excluded from chain data. Unknown root files, notice directories and notice symlinks are rejected.
 
-ZIP input allows at most 500 members, the same per-file and total expanded-byte bounds and expansion ratio at most 1,000. All members are checked before extraction. Absolute paths, parent traversal, backslashes, symbolic/special files, duplicate normalized members and paths deeper than chain/file are rejected. Extraction streams into a private temporary directory. Invalid files, headers, row widths and missing references raise explicit errors. Temporary extraction and validation data are removed on success or failure.
+ZIP input allows at most 500 members, the same per-file and total expanded-byte bounds and expansion ratio at most 1,000. All members are checked before extraction. Absolute paths, parent traversal, backslashes, symbolic/special files, duplicate normalized members and paths deeper than chain/file are rejected. Extraction streams into a private temporary directory. Invalid files, headers, row widths and missing references raise explicit errors. The SQLite validation connection closes after its transaction commits or rolls back. Temporary extraction and validation data are removed on success or failure.
 
 ## Upgrade and checks
 
