@@ -2,7 +2,7 @@
 
 Run `python -m service.db.import YYYY-MM-DD/` or `python -m service.db.import YYYY-MM-DD.zip` in the configured service runtime. Input is the existing normalized archive format, with one directory per chain and `stores.csv`, `products.csv` and `prices.csv`. No downloader is included. Required headers follow `crawler/store/output.py`; old inputs may omit `special_price`, `available`, `anchor_price_date` and `special_sale_type`.
 
-The directory or archive name supplies the collection date. It must be a real calendar date written YYYY-MM-DD. An anchor date describes the reference price only. Availability accepts empty/unknown, true/false and normalized 1/0. Unknown availability or an absent listing proves nothing about current stock. Sale provenance is retained as supplied.
+The directory or archive name supplies the source date; it does not establish when each shop collected its prices. It must be a real calendar date written YYYY-MM-DD. An anchor date describes the reference price only. Availability accepts empty/unknown, true/false and normalized 1/0. Unknown availability or an absent listing proves nothing about current stock. Sale provenance is retained as supplied.
 
 Validation streams each CSV into a private temporary snapshot and uses a disk-backed SQLite index to check references and duplicate payloads before PostgreSQL mutation. Identical source product/store rows and observations collapse. Conflicting complete source rows or different offers for canonical aliases in one chain/store/date reject the entire input. Price equality alone does not erase contradictory availability, promotion or reference metadata. There is no cheapest-wins rule.
 
@@ -15,6 +15,8 @@ The complete validated input, all chains, prices, metadata and statistics commit
 ## Resource bounds
 
 Named internal constants currently allow 100 chain directories, 2 GiB per CSV and 8 GiB total normalized CSV bytes, with fields up to 64 KiB and write batches of 1,000 rows. There is no total-row truncation. PostgreSQL store/product identity maps still scale with the input/catalogue; validation indexes and snapshots require temporary disk space proportional to input. These are engineering limits, with no national-capacity claim.
+
+The crawler's root-level `archive-info.txt` notice is accepted as a bounded regular file and excluded from chain data. Unknown root files, notice directories and notice symlinks are rejected.
 
 ZIP input allows at most 500 members, the same per-file and total expanded-byte bounds and expansion ratio at most 1,000. All members are checked before extraction. Absolute paths, parent traversal, backslashes, symbolic/special files, duplicate normalized members and paths deeper than chain/file are rejected. Extraction streams into a private temporary directory. Invalid files, headers, row widths and missing references raise explicit errors. Temporary extraction and validation data are removed on success or failure.
 
