@@ -15,3 +15,9 @@ For an existing disposable PostgreSQL server, run `uv run --frozen pytest tests/
 The same bootstrap operation upgrades the old wrapper, so this change needs no migration runner or separate operator command. No applied migration file is rewritten. It does not relocate or drop extensions, change importer behavior, alter API limits, repair arbitrary pre-existing index corruption or change authentication caching. As before, bootstrap requires a trusted owner connection and an application schema protected from untrusted DDL. This change addresses caller search paths inside the wrapper; it does not make all bootstrap statements safe under an untrusted deployment search path.
 
 The tests verify fresh and repeated bootstrap, replacement of the old function body, hostile function/dictionary shadowing, a non-public extension namespace, an expression-index query plan and real authenticated HTTP serialization. Later import, publication and pagination tests can reuse these fixtures without adding another test runtime.
+
+## Review regressions
+
+Cleanup tests preserve both the latest raw-price date and the latest statistics-backed API date per chain, including imports with no statistics, older statistics, a raw date after the cutoff, and the cutoff boundary. Dry-run counts must equal actual deletions. Only test VACUUM execution is replaced.
+
+API key log paths use the escaped ASGI `raw_path`, or quote the decoded ASGI path when it is absent. Query strings are excluded. Control characters and field whitespace are percent-escaped; ordinary spaces remain valid in the final user-agent field. Source behavior was checked in [Uvicorn 0.34.2](https://github.com/encode/uvicorn/blob/0.34.2/uvicorn/protocols/http/h11_impl.py) and [Starlette 0.46.2](https://github.com/encode/starlette/blob/0.46.2/starlette/datastructures.py). Authentication and cache policies are unchanged.

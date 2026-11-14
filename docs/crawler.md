@@ -689,3 +689,9 @@ CRAWLERS = {
 - [ ] Check if the site uses non-standard formats (Excel, XML, JSON API)
 
 This architecture provides a solid foundation for implementing new crawlers while maintaining consistency and reliability across all retail chain implementations.
+
+### Anchor dates from alternative columns
+
+`ANCHOR_PRICE_COLUMN_DATES` associates a verified reference date with a source column. CSV parsing uses the first present column in `PRICE_MAP`, including an empty value, and carries that column's date into product cleanup. An explicit per-product date takes precedence; an absent anchor price always has no date. Other chains retain their `ANCHOR_PRICE_DATE` defaults.
+
+Plodine's dated 2025 column and Gavranović's legacy 2025 column establish 2025-05-02. Plodine's generic column has no known date. Gavranović's renamed 2026 column has no reliable reference date because its values did not change with the header.

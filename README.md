@@ -216,6 +216,7 @@ cijene čiji je datum stariji od današnjeg datuma umanjenog za zadani broj
 dana.
 
 Što ostaje:
+- Najnoviji datum sirovih cijena svakog lanca i najnoviji datum iz `chain_stats`, čak i kad se razlikuju nakon uvoza s `--skip-stats`.
 - Najnoviji podaci svakog lanca, i kad su stariji od granice, kako bi API i
   dalje prikazivao lance koji su prestali objavljivati cijene. Za takve
   lance skripta ispisuje upozorenje.
