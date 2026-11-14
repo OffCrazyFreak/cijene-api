@@ -7,6 +7,7 @@ from datetime import date
 from time import monotonic
 from typing import (
     Any,
+    Callable,
     AsyncGenerator,
     AsyncIterator,
     List,
@@ -29,6 +30,16 @@ from .models import (
     StoreWithId,
     User,
 )
+
+
+def _unique_batch[T](rows: list[T], key: Callable[[T], tuple]) -> list[T]:
+    unique: dict[tuple, T] = {}
+    for row in rows:
+        identity = key(row)
+        if identity in unique and unique[identity] != row:
+            raise ValueError("Conflicting duplicate batch row")
+        unique[identity] = row
+    return list(unique.values())
 
 
 class PostgresDatabase(Database):
@@ -650,6 +661,9 @@ class PostgresDatabase(Database):
             )
 
     async def add_many_prices(self, prices: list[Price]) -> int:
+        prices = _unique_batch(
+            prices, lambda row: (row.chain_product_id, row.store_id, row.price_date)
+        )
         async with self._atomic() as conn:
             await conn.execute(
                 """
@@ -723,6 +737,9 @@ class PostgresDatabase(Database):
         self,
         chain_products: List[ChainProduct],
     ) -> int:
+        chain_products = _unique_batch(
+            chain_products, lambda row: (row.chain_id, row.code)
+        )
         async with self._atomic() as conn:
             await conn.execute(
                 """

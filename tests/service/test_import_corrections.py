@@ -176,3 +176,50 @@ def test_provenance_upgrade(database):
                 }
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["products", "prices"])
+@pytest.mark.parametrize("conflicting", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_bulk_duplicate_keys(database, tmp_path, kind, conflicting, reverse):
+    from dataclasses import replace
+    from datetime import date
+    from decimal import Decimal
+
+    from service.db.models import ChainProduct, Price
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            with patch.object(importer, "db", db):
+                await importer.import_directory(write_day(tmp_path))
+            async with db._get_conn() as conn:
+                product = await conn.fetchrow("SELECT * FROM chain_products")
+                store_id = await conn.fetchval("SELECT id FROM stores")
+            if kind == "products":
+                row = ChainProduct(
+                    chain_id=product["chain_id"],
+                    product_id=product["product_id"],
+                    code=product["code"],
+                    name="Updated",
+                )
+                other = replace(row, name="Conflicting") if conflicting else row
+                operation = db.add_many_chain_products
+                query = "SELECT name FROM chain_products"
+                before, after = "Original", "Updated"
+            else:
+                row = Price(product["id"], store_id, date(2026, 11, 14), Decimal("4"))
+                other = replace(row, regular_price=Decimal("5")) if conflicting else row
+                operation = db.add_many_prices
+                query = "SELECT regular_price FROM prices"
+                before, after = Decimal("2"), Decimal("4")
+            rows = [other, row] if reverse else [row, other]
+            if conflicting:
+                with pytest.raises(ValueError, match="Conflicting duplicate batch row"):
+                    await operation(rows)
+                assert await db._fetchval(query) == before
+            else:
+                assert await operation(rows) == 1
+                assert await db._fetchval(query) == after
+
+    asyncio.run(run())
