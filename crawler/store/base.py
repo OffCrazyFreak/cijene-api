@@ -117,8 +117,9 @@ class BaseCrawler:
     Columns the source file must contain. A missing one is a breaking format
     change: the file is abandoned and an error is logged.
 
-    Every crawler declares this, like PRICE_MAP and FIELD_MAP above. The two
-    crawlers that parse by column position rather than by name declare it empty.
+    Every crawler declares this, like PRICE_MAP and FIELD_MAP above. Crawlers
+    that parse files with their own code instead of the maps (dm, Djelo Vodice)
+    call `check_columns` themselves.
 
     This deliberately repeats column names from the maps above, because it
     answers a different question than the `is_required` flag there. That flag
@@ -133,6 +134,18 @@ class BaseCrawler:
     Columns we expect but can process without, such as the ones dropped by
     NN 101/2026. A missing one is logged as a warning and parsing continues.
     """
+
+    ANCHOR_PRICE_DATE: datetime.date | None = None
+    """
+    Reference date of the anchor price, as stated in the anchor price column
+    header the chain publishes (e.g. "Sidrena cijena na 2.5.2025"). Set per
+    crawler from that header, not detected at runtime. None when the header
+    doesn't state a date: the date is then left empty rather than guessed.
+    A date the chain publishes per product takes precedence.
+    """
+
+    ANCHOR_PRICE_COLUMN_DATES: dict[str, datetime.date | None] = {}
+    """Dates established for individual source columns, overriding the chain default."""
 
     TRUE_VALUES = frozenset({"dostupno", "dostupan", "da", "d", "1", "true", "yes"})
     FALSE_VALUES = frozenset(
@@ -149,6 +162,10 @@ class BaseCrawler:
         # The maps and column lists are class attributes and nothing mutates
         # them at runtime, so the lowercased lookup keys are computed once here
         # rather than per row or per file.
+        self._anchor_column_dates = {
+            column.lower(): value
+            for column, value in self.ANCHOR_PRICE_COLUMN_DATES.items()
+        }
         self._price_specs = self._compile_map(self.PRICE_MAP)
         self._field_specs = self._compile_map(self.FIELD_MAP)
         self._bool_specs = self._compile_map(self.BOOL_MAP)
@@ -186,7 +203,7 @@ class BaseCrawler:
 
         A bare string is wrapped rather than iterated, since a string is itself
         a sequence of characters. Empty names are dropped: a few crawlers
-        declare a field the source doesn't have, such as Vrutak's anchor price.
+        declare a field the source doesn't have, such as Vrutak's special price.
         """
         names = [spec] if isinstance(spec, str) else list(spec)
         names = [name for name in names if name]
@@ -673,6 +690,28 @@ class BaseCrawler:
             if unicodedata.category(c) != "Mn"
         )
 
+    @staticmethod
+    def parse_anchor_date(value: str) -> str:
+        """
+        Parse an anchor price date published by the chain, best-effort.
+
+        Args:
+            value: Date such as "2.5.2025", "02.05.2025." or "02052025"
+
+        Returns:
+            ISO date, or "" if the value isn't a recognized date
+        """
+        # Clean up common noise: trailing dots, double dots
+        value = value.strip().rstrip(".").replace("..", ".")
+
+        for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d%m%Y"):
+            try:
+                return datetime.datetime.strptime(value, fmt).date().isoformat()
+            except ValueError:
+                continue
+
+        return ""
+
     def fix_product_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
         Do any cleaning or transformation of the Product data here.
@@ -702,8 +741,17 @@ class BaseCrawler:
             else:
                 data["price"] = data["special_price"]
 
-        if data.get("anchor_price") is not None and not data.get("anchor_price_date"):
-            data["anchor_price_date"] = datetime.date(2025, 5, 2).isoformat()
+        # A date published per product wins over the one stated in the header
+        header_date = data.pop("_anchor_header_date", self.ANCHOR_PRICE_DATE)
+        source_date = self.parse_anchor_date(data.get("anchor_price_date") or "")
+        if data.get("anchor_price") is None:
+            data["anchor_price_date"] = None
+        elif source_date:
+            data["anchor_price_date"] = source_date
+        elif header_date:
+            data["anchor_price_date"] = header_date.isoformat()
+        else:
+            data["anchor_price_date"] = None
 
         # Distinguish "no promotion" from "chain publishes a name for it"
         if data.get("special_sale_type") is not None:
@@ -725,7 +773,12 @@ class BaseCrawler:
         # Candidate keys are tried in order and matched on presence, so an empty
         # value in the first one doesn't fall through and read another column.
         for field, names, keys, is_required in self._price_specs:
-            value = next((row[key] for key in keys if key in row), None)
+            source_column = next((key for key in keys if key in row), None)
+            value = row[source_column] if source_column is not None else None
+            if field == "anchor_price":
+                data["_anchor_header_date"] = self._anchor_column_dates.get(
+                    source_column, self.ANCHOR_PRICE_DATE
+                )
             try:
                 data[field] = self.parse_price(value, is_required)
             except ValueError as err:

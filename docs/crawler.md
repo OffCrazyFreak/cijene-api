@@ -105,7 +105,8 @@ class Product(BaseModel):
     best_price_30: Optional[Decimal] = None      # Lowest price in 30 days
     special_price: Optional[Decimal] = None      # Promotional price
     available: Optional[bool] = None             # In stock
-    anchor_price: Optional[Decimal] = None       # Reference price (2.5.2025)
+    special_sale_type: Optional[str] = None      # Name of the special form of sale
+    anchor_price: Optional[Decimal] = None       # Reference price (sidrena cijena)
     anchor_price_date: Optional[str] = None      # Date of anchor price
     packaging: Optional[str] = None              # Packaging info
     initial_price: Optional[Decimal] = None      # Initial price for new products
@@ -561,7 +562,7 @@ The output system generates three CSV files per chain:
    - `product_id`, `barcode`, `name`, `brand`, `category`, `unit`, `quantity`
 
 3. **prices.csv**: Price data linking stores and products
-   - `store_id`, `product_id`, `price`, `unit_price`, `best_price_30`, `anchor_price`, `special_price`, `available`
+   - `store_id`, `product_id`, `price`, `unit_price`, `best_price_30`, `anchor_price`, `special_price`, `available`, `special_sale_type`, `anchor_price_date`
 
 ### ZIP Archive
 
@@ -688,3 +689,9 @@ CRAWLERS = {
 - [ ] Check if the site uses non-standard formats (Excel, XML, JSON API)
 
 This architecture provides a solid foundation for implementing new crawlers while maintaining consistency and reliability across all retail chain implementations.
+
+### Anchor dates from alternative columns
+
+`ANCHOR_PRICE_COLUMN_DATES` associates a verified reference date with a source column. CSV parsing uses the first present column in `PRICE_MAP`, including an empty value, and carries that column's date into product cleanup. An explicit per-product date takes precedence; an absent anchor price always has no date. Other chains retain their `ANCHOR_PRICE_DATE` defaults.
+
+Plodine's dated 2025 column and Gavranović's legacy 2025 column establish 2025-05-02. Plodine's generic column has no known date. Gavranović's renamed 2026 column has no reliable reference date because its values did not change with the header.

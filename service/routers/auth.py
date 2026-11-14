@@ -1,12 +1,30 @@
+import os
 import time
 import logging
-from fastapi import Depends, HTTPException, status
+import unicodedata
+from urllib.parse import quote, quote_from_bytes
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from service.config import settings
 from service.db.models import User
 
 logger = logging.getLogger(__name__)
+
+# Record which user makes each request.
+# Off unless API_KEY_LOG is set to a file path.
+# Line format (space-separated):
+#   <timestamp> <user id> <method> <path> <client host> <user agent...>
+_key_log: logging.Logger | None = None
+if _key_log_path := os.getenv("API_KEY_LOG"):
+    _key_log = logging.getLogger("api_key_log")
+    _key_log.propagate = False
+    _key_log.setLevel(logging.INFO)
+    _key_log_handler = logging.FileHandler(_key_log_path)
+    _key_log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z")
+    )
+    _key_log.addHandler(_key_log_handler)
 
 # Security scheme for OpenAPI documentation
 security_scheme = HTTPBearer(scheme_name="HTTPBearer")
@@ -61,13 +79,33 @@ async def _lookup_user_by_token(api_key: str) -> User | None:
     return user
 
 
+def _log_field(value: str, allow_spaces: bool = False) -> str:
+    return "".join(
+        quote(char, safe="")
+        if unicodedata.category(char).startswith("C")
+        or (char.isspace() and not (allow_spaces and char == " "))
+        else char
+        for char in value
+    )
+
+
+def _request_log_path(request: Request) -> str:
+    raw_path = request.scope.get("raw_path")
+    safe = "/:@!$&'()*+,;=-._~"
+    if raw_path is not None:
+        return quote_from_bytes(raw_path, safe=safe + "%")
+    return quote(request.scope["path"], safe=safe)
+
+
 async def verify_authentication(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
 ) -> User:
     """
     Verify bearer token authentication.
 
     Args:
+        request: The incoming request (used for the optional key log).
         credentials: The HTTP authorization credentials containing the bearer token.
 
     Returns:
@@ -83,6 +121,15 @@ async def verify_authentication(
         )
 
     logger.debug(f"Authenticated access for user: {user.name} (id={user.id})")
+    if _key_log:
+        _key_log.info(
+            "%s %s %s %s %s",
+            user.id,
+            _log_field(request.method),
+            _request_log_path(request),
+            _log_field(request.client.host if request.client else "-"),
+            _log_field(request.headers.get("user-agent", "-"), allow_spaces=True),
+        )
     return user
 
 
