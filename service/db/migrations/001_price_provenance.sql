@@ -1,0 +1,4 @@
+ALTER TABLE prices
+    ADD COLUMN IF NOT EXISTS available BOOLEAN,
+    ADD COLUMN IF NOT EXISTS anchor_price_date DATE,
+    ADD COLUMN IF NOT EXISTS special_sale_type VARCHAR(255);

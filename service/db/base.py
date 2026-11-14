@@ -21,6 +21,9 @@ from .models import (
 class Database(ABC):
     """Base abstract class for database implementations."""
 
+    def import_transaction(self):
+        raise NotImplementedError("Atomic imports require transaction support")
+
     @abstractmethod
     async def connect(self) -> None:
         """Initialize the database connection."""

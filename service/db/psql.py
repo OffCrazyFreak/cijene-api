@@ -1,6 +1,8 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from pathlib import Path
 from datetime import date
 from time import monotonic
 from typing import (
@@ -44,6 +46,9 @@ class PostgresDatabase(Database):
         self.min_size = min_size
         self.max_size = max_size
         self.pool = None
+        self._import_conn: ContextVar[asyncpg.Connection | None] = ContextVar(
+            "import_connection", default=None
+        )
         self.logger = logging.getLogger(__name__)
 
     async def connect(self) -> None:
@@ -56,6 +61,10 @@ class PostgresDatabase(Database):
     @asynccontextmanager
     async def _get_conn(self) -> AsyncGenerator[asyncpg.Connection]:
         """Context manager to acquire a connection from the pool."""
+        active = self._import_conn.get()
+        if active is not None:
+            yield active
+            return
         if not self.pool:
             raise RuntimeError("Database pool is not initialized")
         async with self.pool.acquire() as conn:
@@ -67,6 +76,19 @@ class PostgresDatabase(Database):
         async with self._get_conn() as conn:
             async with conn.transaction():
                 yield conn
+
+    @asynccontextmanager
+    async def import_transaction(self):
+        if self._import_conn.get() is not None:
+            raise RuntimeError("Nested import is unsupported")
+        async with self._get_conn() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(73198421)")
+                token = self._import_conn.set(conn)
+                try:
+                    yield
+                finally:
+                    self._import_conn.reset(token)
 
     async def close(self) -> None:
         """Close all database connections."""
@@ -81,7 +103,12 @@ class PostgresDatabase(Database):
                 schema_sql = f.read()
 
             async with self._get_conn() as conn:
-                await conn.execute(schema_sql)
+                async with conn.transaction():
+                    await conn.execute(schema_sql)
+                    for migration in sorted(
+                        (Path(__file__).parent / "migrations").glob("*.sql")
+                    ):
+                        await conn.execute(migration.read_text())
                 self.logger.info("Database tables created successfully")
         except Exception as e:
             self.logger.error(f"Error creating tables: {e}")
@@ -634,7 +661,10 @@ class PostgresDatabase(Database):
                     special_price DECIMAL(10, 2),
                     unit_price DECIMAL(10, 2),
                     best_price_30 DECIMAL(10, 2),
-                    anchor_price DECIMAL(10, 2)
+                    anchor_price DECIMAL(10, 2),
+                    available BOOLEAN,
+                    anchor_price_date DATE,
+                    special_sale_type VARCHAR(255)
                 )
                 """
             )
@@ -650,6 +680,9 @@ class PostgresDatabase(Database):
                         p.unit_price,
                         p.best_price_30,
                         p.anchor_price,
+                        p.available,
+                        p.anchor_price_date,
+                        p.special_sale_type,
                     )
                     for p in prices
                 ),
@@ -664,10 +697,21 @@ class PostgresDatabase(Database):
                     special_price,
                     unit_price,
                     best_price_30,
-                    anchor_price
+                    anchor_price,
+                    available,
+                    anchor_price_date,
+                    special_sale_type
                 )
                 SELECT * from temp_prices
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (chain_product_id, store_id, price_date) DO UPDATE SET
+                    regular_price = EXCLUDED.regular_price,
+                    special_price = EXCLUDED.special_price,
+                    unit_price = EXCLUDED.unit_price,
+                    best_price_30 = EXCLUDED.best_price_30,
+                    anchor_price = EXCLUDED.anchor_price,
+                    available = EXCLUDED.available,
+                    anchor_price_date = EXCLUDED.anchor_price_date,
+                    special_sale_type = EXCLUDED.special_sale_type
                 """
             )
             await conn.execute("DROP TABLE temp_prices")
@@ -724,7 +768,13 @@ class PostgresDatabase(Database):
                     quantity
                 )
                 SELECT * from temp_chain_products
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (chain_id, code) DO UPDATE SET
+                    product_id = EXCLUDED.product_id,
+                    name = EXCLUDED.name,
+                    brand = EXCLUDED.brand,
+                    category = EXCLUDED.category,
+                    unit = EXCLUDED.unit,
+                    quantity = EXCLUDED.quantity
                 """
             )
             await conn.execute("DROP TABLE temp_chain_products")

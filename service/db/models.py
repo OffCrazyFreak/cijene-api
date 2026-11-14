@@ -98,6 +98,10 @@ class Price:
     best_price_30: Optional[Decimal] = None
     anchor_price: Optional[Decimal] = None
 
+    available: bool | None = None
+    anchor_price_date: date | None = None
+    special_sale_type: str | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class StorePrice:
