@@ -126,7 +126,17 @@ def remember(index: sqlite3.Connection, kind: str, key: str, row: dict) -> bool:
 
 
 def prepare_input(path: Path, destination: Path) -> None:
-    chains = sorted(path.iterdir())
+    chains = []
+    for entry in sorted(path.iterdir()):
+        if (
+            entry.name == "archive-info.txt"
+            and not entry.is_symlink()
+            and entry.is_file()
+        ):
+            if entry.stat().st_size > MAX_FILE_BYTES:
+                raise ValueError("Archive notice exceeds byte limit")
+            continue
+        chains.append(entry)
     if not chains or len(chains) > MAX_CHAINS:
         raise ValueError("Input must contain bounded chain directories")
     total = 0
