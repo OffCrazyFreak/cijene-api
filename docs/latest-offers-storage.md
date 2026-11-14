@@ -35,3 +35,9 @@ Cleanup holds the lock from protection calculation through all date deletions. E
 Integration tests use disposable PostgreSQL 17 and cover fresh/legacy/repeated/concurrent initialization, failed and cancelled backfill, full payload preservation, inherited connections, cancellation reset, independent reader visibility, writer locking and import/cleanup ordering. Existing importer and HTTP tests remain the compatibility guard.
 
 Incoming publication, active/previous transitions, rollback, generation-aware reads, complete search and pagination remain later work. Before changing read semantics, publish writers and read adapters together and validate generation retention dependencies. Downgrading to old mutable readers after publication is enabled is unsupported; use a reviewed recovery procedure rather than silently starting an older binary.
+
+## Incoming publication
+
+Validated imports now publish inside the serialized writer transaction. Immutable version rows are reused when their complete payload is unchanged; each generation records membership for the latest observation of every source product/shop identity. The active and previous pointers change only after acceptance. Empty initialization is handled explicitly on the first non-empty import. Identical replay retains the current generation. Enrichment CLI work uses the same publication transaction, while direct accepted-metadata updates require that boundary. Legacy statistics updates do not affect latest reads.
+
+Latest v1 product, directory, price and statistics routes read immutable members. Product pages retain their generation in validated cursors. See [latest search](search.md) for filters, ordering, response additions and verification limits. Rollback commands and physical reclamation remain deferred.
