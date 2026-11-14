@@ -817,7 +817,7 @@ class PostgresDatabase(Database):
 
     async def _get_kept_chains(self, before: date) -> dict[date, list[int]]:
         """
-        Find the chains whose latest data is from before the given date.
+        Find raw-price and stats-backed latest dates before the cutoff.
 
         Returns:
             Chain IDs per latest data date. The rows of these chains on
@@ -826,10 +826,17 @@ class PostgresDatabase(Database):
         async with self._get_conn() as conn:
             rows = await conn.fetch(
                 """
-                SELECT chain_id, max(price_date) AS latest
-                FROM chain_stats
-                GROUP BY chain_id
-                HAVING max(price_date) < $1
+                SELECT chain_id, latest FROM (
+                    SELECT cp.chain_id, max(p.price_date) AS latest
+                    FROM prices p
+                    JOIN chain_products cp ON cp.id = p.chain_product_id
+                    GROUP BY cp.chain_id
+                    UNION
+                    SELECT chain_id, max(price_date) AS latest
+                    FROM chain_stats
+                    GROUP BY chain_id
+                ) protected
+                WHERE latest < $1
                 """,
                 before,
             )
