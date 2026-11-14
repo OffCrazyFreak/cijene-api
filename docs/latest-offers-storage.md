@@ -26,9 +26,9 @@ The one-time baseline copies retained metadata and one latest offer per identity
 
 ## Transactions and cleanup
 
-Import and cleanup transactions use the same advisory writer lock and read-committed isolation. A transaction connection belongs to its creating asyncio task. Database calls made by an inherited child context fail before SQL, including children released after the parent exits. Independent tasks acquire independent pooled connections. Nested writer modes fail. Context tokens reset in `finally`, including cancellation. Importers remain sequential.
+Imports and cleanup coordinate through the same advisory writer lock. Imports and cleanup counts use read-committed transactions. Destructive cleanup holds a session lock across separate per-date transactions, retaining completed dates after an interruption. The session lock is released in `finally`, including cancellation while waiting for or holding it. A transaction connection belongs to its creating asyncio task. Database calls made by an inherited child context fail before SQL, including children released after the parent exits. Independent tasks acquire independent pooled connections. Nested writer modes fail. Context tokens reset in `finally`, including cancellation. Importers remain sequential.
 
-Cleanup holds the lock from protection calculation through all date deletions. VACUUM runs after the transaction. With any accepted generation, direct deletion and the CLI fail clearly. Direct counts return an empty deletion plan with a protected-state warning; CLI dry-run reports that all prices are protected. The database rechecks protection under the lock even after the CLI check, preventing an initialization race. No dry-run reports rows as deletable when generation retention forbids deletion.
+Cleanup holds the lock from protection calculation through all date deletions. Each date commits independently, and VACUUM runs after the lock is released. With any accepted generation, direct deletion and the CLI fail clearly. Direct counts return an empty deletion plan with a protected-state warning; CLI dry-run reports that all prices are protected. The database rechecks protection under the lock even after the CLI check, preventing an initialization race. No dry-run reports rows as deletable when generation retention forbids deletion.
 
 ## Verification and later work
 
