@@ -9,18 +9,21 @@ stored in the database. It can be used independently or as part of the import pr
 import argparse
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from time import time
 from typing import Union
 
 from service.config import settings
+from service.db.base import Database
 
 logger = logging.getLogger("stats")
 
 db = settings.get_db()
 
 
-async def compute_stats(price_date: Union[datetime, str]) -> None:
+async def compute_stats(
+    price_date: Union[date, datetime, str], *, database: Database | None = None
+) -> None:
     """
     Compute statistics for the given date.
 
@@ -39,10 +42,11 @@ async def compute_stats(price_date: Union[datetime, str]) -> None:
     t0 = time()
 
     logger.debug(f"Computing average chain prices for {price_date:%Y-%m-%d}")
-    await db.compute_chain_prices(price_date)
+    target = database if database is not None else db
+    await target.compute_chain_prices(price_date)
 
     logger.debug(f"Computing chain stats for {price_date:%Y-%m-%d}")
-    await db.compute_chain_stats(price_date)
+    await target.compute_chain_stats(price_date)
 
     dt = int(time() - t0)
     logger.info(f"Computed statistics for {price_date:%Y-%m-%d} in {dt} seconds")
