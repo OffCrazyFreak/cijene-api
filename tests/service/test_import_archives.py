@@ -1,5 +1,6 @@
 import asyncio
 import stat
+import shutil
 import zipfile
 from unittest.mock import patch
 
@@ -74,7 +75,7 @@ def test_invalid_root_notice(tmp_path, notice_kind):
     if notice_kind == "symlink":
         notice.symlink_to(day / "test" / "stores.csv")
     elif notice_kind == "directory":
-        notice.mkdir()
+        shutil.copytree(day / "test", notice)
     elif notice_kind == "unexpected":
         (day / "unexpected.txt").write_text("Unexpected root file")
     else:
@@ -87,3 +88,44 @@ def test_invalid_root_notice(tmp_path, notice_kind):
     ):
         with pytest.raises(ValueError):
             prepare_input(day, destination)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_validation_closes_sqlite_connection(tmp_path, invalid):
+    import sqlite3
+
+    from service.db import input_rows
+    from tests.service.import_fixtures import rewrite
+
+    day = write_day(tmp_path)
+    if invalid:
+        rewrite(day / "test" / "prices.csv", lambda rows: rows[0].update(price="bad"))
+    destination = tmp_path / "snapshot"
+    destination.mkdir()
+    connections = []
+    connect = sqlite3.connect
+
+    def capture(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    try:
+        with patch.object(input_rows.sqlite3, "connect", side_effect=capture):
+            if invalid:
+                with pytest.raises(ValueError):
+                    prepare_input(day, destination)
+            else:
+                prepare_input(day, destination)
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connections[0].execute("SELECT 1")
+        check = connect(destination / "validation.sqlite")
+        try:
+            count = check.execute("SELECT count(*) FROM entries").fetchone()[0]
+            assert count == (0 if invalid else 4)
+        finally:
+            check.close()
+    finally:
+        for connection in connections:
+            connection.close()

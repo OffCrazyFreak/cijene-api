@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import sqlite3
+from contextlib import closing
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -128,11 +129,9 @@ def remember(index: sqlite3.Connection, kind: str, key: str, row: dict) -> bool:
 def prepare_input(path: Path, destination: Path) -> None:
     chains = []
     for entry in sorted(path.iterdir()):
-        if (
-            entry.name == "archive-info.txt"
-            and not entry.is_symlink()
-            and entry.is_file()
-        ):
+        if entry.name == "archive-info.txt":
+            if entry.is_symlink() or not entry.is_file():
+                raise ValueError("Archive notice must be a regular file")
             if entry.stat().st_size > MAX_FILE_BYTES:
                 raise ValueError("Archive notice exceeds byte limit")
             continue
@@ -140,7 +139,7 @@ def prepare_input(path: Path, destination: Path) -> None:
     if not chains or len(chains) > MAX_CHAINS:
         raise ValueError("Input must contain bounded chain directories")
     total = 0
-    with sqlite3.connect(destination / "validation.sqlite") as index:
+    with closing(sqlite3.connect(destination / "validation.sqlite")) as index, index:
         index.execute(
             "CREATE TABLE entries (kind TEXT, key TEXT, payload TEXT, PRIMARY KEY(kind,key))"
         )
