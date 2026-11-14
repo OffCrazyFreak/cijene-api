@@ -61,7 +61,7 @@ def test_latest_http_contract(database, service_client, tmp_path):
 def test_request_keeps_generation_during_publication(database, tmp_path):
     from contextlib import asynccontextmanager
 
-    from service.db.search import SQL, search
+    from service.db.search import search
 
     async def run():
         async with database() as db:
@@ -80,7 +80,7 @@ def test_request_keeps_generation_during_publication(database, tmp_path):
                         return getattr(self.conn, name)
 
                     async def fetch(self, query, *args):
-                        if query == SQL:
+                        if "SELECT DISTINCT cp.name" in query:
                             pinned.set()
                             await asyncio.wait_for(published.wait(), 10)
                         return await self.conn.fetch(query, *args)
@@ -110,5 +110,122 @@ def test_request_keeps_generation_during_publication(database, tmp_path):
                         await asyncio.gather(writer, return_exceptions=True)
                 assert result["products"][0]["avg_price"] == 2
                 assert (await search(db, q="mlijeko"))["products"][0]["avg_price"] == 3
+
+    asyncio.run(run())
+
+
+def test_review_blockers_http_and_bounded_matching(database, service_client):
+    import time
+    import tracemalloc
+    from contextlib import asynccontextmanager
+
+    from service.db import search as matcher
+
+    async def run():
+        async with database() as db:
+            async with service_client(db) as client:
+                token = token_hex(32)
+                await db._fetchval(
+                    "INSERT INTO users(name,api_key) VALUES('test',$1) RETURNING id",
+                    token,
+                )
+                async with db.import_transaction():
+                    async with db._get_conn() as conn:
+                        await conn.execute("INSERT INTO chains(code) VALUES('test')")
+                        await conn.execute(
+                            "INSERT INTO stores(chain_id,code,city) SELECT 1,i::text,CASE WHEN i=1 THEN 'Here' ELSE 'Elsewhere' END FROM generate_series(1,100) i"
+                        )
+                        candidates = [
+                            ("Limuni svjezi", "", "1", "kg"),
+                            ("Pivo limun", "", "1", "l"),
+                            ("Krumpiri svjezi", "", "1", "kg"),
+                            ("Krumpir cips", "", "1", "kg"),
+                            ("Mlijeko trajno", "", "1", "l"),
+                            ("Mlijeko trajno", "", "1000", "ml"),
+                            ("Mlijeko trajno", "", "2", "l"),
+                            ("Milkana sir", "Milkana", "1", "kg"),
+                            ("Cokolada", "Milka", "1", "kg"),
+                            ("Unrelated", "", "1", "kg"),
+                            ("Mlijeko 2l 1kom", "", None, None),
+                        ]
+                        for i, (name, brand, quantity, unit) in enumerate(
+                            candidates, 1
+                        ):
+                            await conn.execute(
+                                "INSERT INTO products(ean) VALUES($1)", str(i)
+                            )
+                            await conn.execute(
+                                "INSERT INTO chain_products(chain_id,product_id,code,name,brand,quantity,unit) VALUES(1,$1,$2,$3,$4,$5,$6)",
+                                i,
+                                str(i),
+                                name,
+                                brand,
+                                quantity,
+                                unit,
+                            )
+                        await conn.execute(
+                            "INSERT INTO prices(chain_product_id,store_id,price_date,regular_price) SELECT cp.id,s.id,'2026-11-14',1 FROM chain_products cp CROSS JOIN stores s WHERE cp.id<>9"
+                        )
+                headers = {"Authorization": f"Bearer {token}"}
+
+                async def get(q):
+                    response = await client.get(
+                        "/v1/products/", params=dict(q=q, city="Here"), headers=headers
+                    )
+                    assert response.status_code == 200, response.text
+                    return response.json()
+
+                calls = []
+                original = matcher.relevance
+
+                def counted(*args, **kwargs):
+                    calls.append(args)
+                    return original(*args, **kwargs)
+
+                fetch_sizes = []
+                original_connection = db._get_conn
+
+                class ObservedConnection:
+                    def __init__(self, conn):
+                        self.conn = conn
+
+                    def __getattr__(self, name):
+                        return getattr(self.conn, name)
+
+                    async def fetch(self, query, *args):
+                        rows = await self.conn.fetch(query, *args)
+                        fetch_sizes.append(len(rows))
+                        return rows
+
+                @asynccontextmanager
+                async def observed_connection():
+                    async with original_connection() as conn:
+                        yield ObservedConnection(conn)
+
+                offer_count = await db._fetchval("SELECT count(*) FROM prices")
+                tracemalloc.start()
+                started = time.monotonic()
+                with (
+                    patch.object(matcher, "relevance", counted),
+                    patch.object(db, "_get_conn", observed_connection),
+                ):
+                    data = await get("limun")
+                elapsed = time.monotonic() - started
+                _, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+                assert len(calls) == len(candidates)
+                assert max(fetch_sizes) <= len(candidates)
+                assert data["products"][0]["ean"] == "1"
+                assert data["products"][0]["shop_count"] == 1
+                assert (await get("krumpir"))["products"][0]["ean"] == "3"
+                assert (await get("limun pivo"))["products"][0]["ean"] == "2"
+                assert {p["ean"] for p in (await get("mlijeko 1l"))["products"]} == {
+                    "5",
+                    "6",
+                }
+                assert (await get("milka"))["products"] == []
+                print(
+                    f"review smoke offers={offer_count} max_fetched_rows={max(fetch_sizes)} variants={len(calls)} selected_shops=1 seconds={elapsed:.3f} python_peak_bytes={peak}"
+                )
 
     asyncio.run(run())

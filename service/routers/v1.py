@@ -320,8 +320,10 @@ async def get_prices(
     if not wanted:
         raise HTTPException(400, "EANs must be non-empty")
     try:
-        rows = filter_location(
-            await latest_prices(db), chains, city, address, lat, lon, d
+        rows = await latest_prices(
+            db,
+            wanted,
+            lambda stores: filter_location(stores, chains, city, address, lat, lon, d),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -416,19 +418,19 @@ class ChainStatsResponse(BaseModel):
 async def chain_stats() -> dict:
     """Return stats of currently loaded data per chain."""
 
-    rows = await latest_prices(db)
-    groups = {}
-    for row in rows:
-        groups.setdefault(row["chain"], []).append(row)
+    from service.db.search import chain_statistics
+
+    rows = await chain_statistics(db)
+
     return {
         "chain_stats": [
             {
-                "chain_code": chain,
-                "price_date": max(r["price_date"] for r in offers),
-                "price_count": len(offers),
-                "store_count": len({r["store_code"] for r in offers}),
+                "chain_code": row["chain"],
+                "price_date": row["price_date"],
+                "price_count": row["price_count"],
+                "store_count": row["store_count"],
                 "created_at": datetime.datetime.now(datetime.timezone.utc),
             }
-            for chain, offers in sorted(groups.items())
+            for row in rows
         ]
     }
