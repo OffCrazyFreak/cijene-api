@@ -39,6 +39,7 @@ INTENT_MODIFIERS = {
     "sirup",
     "aroma",
 }
+MAX_QUERY_LENGTH = 256
 STRICT = {"bez", "bio", "vegan", "light", "zero", "integralno", "laktoze", "glutena"}
 
 
@@ -56,21 +57,39 @@ def normalize(value: str) -> str:
     )
 
 
-def token_distance(left: str, right: str) -> int:
-    if len(left) == len(right):
-        mismatches = [i for i, (a, b) in enumerate(zip(left, right)) if a != b]
-        if len(mismatches) == 2:
-            a, b = mismatches
-            if b == a + 1 and left[a] == right[b] and left[b] == right[a]:
-                return 1
+def token_distance(left: str, right: str, max_distance: int | None = None) -> int:
+    if max_distance is not None and abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+    ceiling = (
+        max_distance + 1 if max_distance is not None else len(left) + len(right) + 1
+    )
     previous = list(range(len(right) + 1))
+    before_previous = None
     for i, a in enumerate(left, 1):
-        current = [i]
-        for j, b in enumerate(right, 1):
-            current.append(
-                min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (a != b))
+        current = [ceiling] * (len(right) + 1)
+        current[0] = i
+        start = max(1, i - max_distance) if max_distance is not None else 1
+        end = (
+            min(len(right), i + max_distance)
+            if max_distance is not None
+            else len(right)
+        )
+        for j in range(start, end + 1):
+            current[j] = min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + (a != right[j - 1]),
             )
-        previous = current
+            if (
+                before_previous is not None
+                and j > 1
+                and a == right[j - 2]
+                and left[i - 2] == right[j - 1]
+            ):
+                current[j] = min(current[j], before_previous[j - 2] + 1)
+        if max_distance is not None and min(current) > max_distance:
+            return max_distance + 1
+        before_previous, previous = previous, current
     return previous[-1]
 
 
@@ -132,7 +151,9 @@ def relevance(
         ):
             quality = max(quality, 1)
         elif len(token) >= 4 and any(
-            token_distance(token, word) <= (2 if len(token) >= 8 else 1)
+            abs(len(token) - len(word)) <= (2 if len(token) >= 8 else 1)
+            and token_distance(token, word, 2 if len(token) >= 8 else 1)
+            <= (2 if len(token) >= 8 else 1)
             for word in substitution_words
         ):
             quality = max(quality, 2)
@@ -240,6 +261,8 @@ async def search(
     cursor: str | None = None,
     identity: str | None = None,
 ) -> dict[str, Any]:
+    if len(q) > MAX_QUERY_LENGTH:
+        raise ValueError("Text search supports at most 256 characters")
     if order not in {"relevance", "price_asc", "price_desc"}:
         raise ValueError("Unsupported order")
     if not 1 <= page_size <= 10000:

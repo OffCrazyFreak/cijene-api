@@ -169,3 +169,50 @@ def test_cursor_retains_exact_decimal_comparator():
         rows, 1, "scope", cursor, "", None, None, None, None, "price_asc", 1, None
     )
     assert [p["ean"] for p in first["products"] + second["products"]] == ["a", "b"]
+
+
+def test_transposition_with_another_edit():
+    from service.db.search import token_distance
+
+    assert token_distance("ockolada", "cokolade") == 2
+    assert token_distance("abcd", "badc") == 2
+    assert relevance("ockolada", "Cokolade", "") is not None
+
+
+def test_impossible_lengths_skip_distance_matrix(monkeypatch):
+    from service.db import search
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Impossible edit distance should be rejected first")
+
+    monkeypatch.setattr(search, "token_distance", unexpected)
+    assert search.relevance("x" * 200, "Mlijeko", "") is None
+
+
+def test_long_query_rejected_before_database_access():
+    import asyncio
+    import pytest
+    from service.db.search import search
+
+    with pytest.raises(ValueError, match="256"):
+        asyncio.run(search(None, q="x" * 257))
+
+
+def test_http_long_query_rejected(database, service_client):
+    import asyncio
+
+    async def run():
+        async with database() as db:
+            async with service_client(db) as client:
+                async with db._get_conn() as conn:
+                    await conn.execute(
+                        "INSERT INTO users(name,api_key) VALUES('fixture','length-fixture')"
+                    )
+                result = await client.get(
+                    "/v1/products/",
+                    params={"q": "x" * 257},
+                    headers={"Authorization": "Bearer length-fixture"},
+                )
+                assert result.status_code == 422
+
+    asyncio.run(run())

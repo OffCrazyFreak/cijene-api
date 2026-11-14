@@ -8,7 +8,13 @@ from pydantic import BaseModel, Field
 from common.barcodes import normalize_barcode
 from service.config import settings
 from service.db.models import ChainStats, StorePrice
-from service.db.search import directory, latest_prices, normalize, selection
+from service.db.search import (
+    MAX_QUERY_LENGTH,
+    directory,
+    latest_prices,
+    normalize,
+    selection,
+)
 from service.routers.auth import RequireAuth
 
 router = APIRouter(tags=["Products, Chains and Stores"], dependencies=[RequireAuth])
@@ -375,7 +381,7 @@ async def get_prices(
     response_model=ProductSearchResponse,
 )
 async def search_products(
-    q: str = Query(""),
+    q: str = Query("", max_length=MAX_QUERY_LENGTH),
     date: datetime.date | None = Query(None),
     chains: str | None = Query(None),
     city: str | None = Query(None),
