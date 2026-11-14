@@ -25,7 +25,9 @@ logger = logging.getLogger("importer")
 db = settings.get_db()
 
 
-async def process_stores(stores_path: Path, chain_id: int) -> dict[str, int]:
+async def process_stores(
+    stores_path: Path, chain_id: int, source: date
+) -> dict[str, int]:
     result = {}
     for row in iter_rows(stores_path):
         store = Store(
@@ -37,12 +39,19 @@ async def process_stores(stores_path: Path, chain_id: int) -> dict[str, int]:
             zipcode=row.get("zipcode"),
         )
         result[store.code] = await db.add_store(store)
+        await db.record_metadata_source_date("stores", [result[store.code]], source)
+
     return result
 
 
 async def process_products(
-    products_path: Path, chain_id: int, chain_code: str, barcodes: dict[str, int]
+    products_path: Path,
+    chain_id: int,
+    chain_code: str,
+    barcodes: dict[str, int],
+    source: date,
 ) -> dict[str, int]:
+    imported_codes = []
     for batch in batched(iter_rows(products_path), BATCH_SIZE):
         products = []
         for row in batch:
@@ -62,7 +71,13 @@ async def process_products(
                 )
             )
         await db.add_many_chain_products(products)
-    return await db.get_chain_product_map(chain_id)
+        imported_codes.extend(p.code for p in products)
+
+    ids = await db.get_chain_product_map(chain_id)
+    await db.record_metadata_source_date(
+        "chain_products", [ids[code] for code in imported_codes], source
+    )
+    return ids
 
 
 async def process_prices(
@@ -101,9 +116,9 @@ async def process_chain(
     price_date: date, chain_dir: Path, barcodes: dict[str, int]
 ) -> None:
     chain_id = await db.add_chain(Chain(code=chain_dir.name))
-    stores = await process_stores(chain_dir / "stores.csv", chain_id)
+    stores = await process_stores(chain_dir / "stores.csv", chain_id, price_date)
     products = await process_products(
-        chain_dir / "products.csv", chain_id, chain_dir.name, barcodes
+        chain_dir / "products.csv", chain_id, chain_dir.name, barcodes, price_date
     )
     await process_prices(
         price_date, chain_dir / "prices.csv", chain_id, stores, products

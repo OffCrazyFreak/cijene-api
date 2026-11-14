@@ -118,3 +118,109 @@ def test_canonical_conflict_rejects_publication(database, tmp_path):
             assert await db._fetchval("SELECT count(*) FROM chain_products") == 1
 
     asyncio.run(run())
+
+
+def test_metadata_source_date_without_new_offer(database, tmp_path):
+    import shutil
+    from tests.service.import_fixtures import rewrite
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            original = write_day(tmp_path, "1.00", "June one")
+            first = original.rename(tmp_path / "2026-06-01")
+            newer = tmp_path / "2026-06-10"
+            shutil.copytree(first, newer)
+            rewrite(
+                newer / "test/products.csv",
+                lambda rows: rows[0].update(name="June ten"),
+            )
+            rewrite(
+                newer / "test/stores.csv", lambda rows: rows[0].update(city="June ten")
+            )
+            prices = newer / "test/prices.csv"
+            prices.write_text(prices.read_text().splitlines()[0] + "\n")
+            older = tmp_path / "2026-06-05"
+            shutil.copytree(first, older)
+            with patch.object(importer, "db", db):
+                for day in (first, newer, older):
+                    await importer.import_directory(day, False)
+            assert await db._fetchval("SELECT name FROM chain_products") == "June ten"
+            assert await db._fetchval("SELECT city FROM stores") == "June ten"
+            for table, field in (("store", "city"), ("chain_product", "name")):
+                assert (
+                    await db._fetchval(
+                        f"SELECT v.{field} FROM publication_state ps JOIN generation_{table}s m ON m.generation_id=ps.active_id JOIN {table}_versions v USING(version_id)"
+                    )
+                    == "June ten"
+                )
+                assert (
+                    str(
+                        await db._fetchval(
+                            f"SELECT v.metadata_source_date FROM publication_state ps JOIN generation_{table}s m ON m.generation_id=ps.active_id JOIN {table}_versions v USING(version_id)"
+                        )
+                    )
+                    == "2026-06-10"
+                )
+
+            assert (
+                str(await db._fetchval("SELECT metadata_source_date FROM stores"))
+                == "2026-06-10"
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["product", "store"])
+def test_direct_metadata_update_serializes_with_first_publication(database, kind):
+    from service.db.generations import publish
+    from service.db.models import Product
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await db._fetchval(
+                "INSERT INTO products(ean,name) VALUES('1','Before') RETURNING id"
+            )
+            await db._fetchval("INSERT INTO chains(code) VALUES('test') RETURNING id")
+            await db._fetchval(
+                "INSERT INTO stores(chain_id,code,city) VALUES(1,'1','Before') RETURNING id"
+            )
+            start = asyncio.Event()
+
+            async def update():
+                await start.wait()
+                if kind == "store":
+                    return await db.update_store(1, "1", city="After")
+                return await db.update_product(Product(ean="1", name="After"))
+
+            worker = asyncio.create_task(update())
+            try:
+                async with db._writer_transaction("import") as conn:
+                    start.set()
+
+                    async def waiting_for_writer():
+                        while not await conn.fetchval(
+                            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=73198421 AND NOT granted)"
+                        ):
+                            assert not worker.done()
+                            await asyncio.sleep(0.01)
+
+                    await asyncio.wait_for(waiting_for_writer(), 5)
+                    assert not worker.done()
+                    await publish(conn)
+                with pytest.raises(RuntimeError, match="import_transaction"):
+                    await asyncio.wait_for(worker, 5)
+                assert (
+                    await db._fetchval("SELECT name FROM products WHERE ean='1'")
+                    == "Before"
+                )
+                assert (
+                    await db._fetchval("SELECT city FROM stores WHERE code='1'")
+                    == "Before"
+                )
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run())

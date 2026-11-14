@@ -25,8 +25,8 @@ async def backfill_legacy(conn: asyncpg.Connection) -> int | None:
     columns = {
         "chain": "id,code,created_at",
         "product": "id,ean,brand,name,quantity,unit,created_at",
-        "store": "id,chain_id,code,type,address,city,zipcode,lat,lon,phone,created_at",
-        "chain_product": "id,chain_id,product_id,code,brand,name,category,unit,quantity,created_at",
+        "store": "id,chain_id,code,type,address,city,zipcode,lat,lon,phone,created_at,metadata_source_date",
+        "chain_product": "id,chain_id,product_id,code,brand,name,category,unit,quantity,created_at,metadata_source_date",
         "offer": "id,chain_product_id,store_id,price_date,regular_price,special_price,unit_price,best_price_30,anchor_price,available,anchor_price_date,special_sale_type",
     }
     for kind, fields in columns.items():
@@ -96,8 +96,8 @@ async def publish(conn: asyncpg.Connection) -> int | None:
     fields_by_kind = {
         "chain": "id,code,created_at",
         "product": "id,ean,brand,name,quantity,unit,created_at",
-        "store": "id,chain_id,code,type,address,city,zipcode,lat,lon,phone,created_at",
-        "chain_product": "id,chain_id,product_id,code,brand,name,category,unit,quantity,created_at",
+        "store": "id,chain_id,code,type,address,city,zipcode,lat,lon,phone,created_at,metadata_source_date",
+        "chain_product": "id,chain_id,product_id,code,brand,name,category,unit,quantity,created_at,metadata_source_date",
         "offer": "id,chain_product_id,store_id,price_date,regular_price,special_price,unit_price,best_price_30,anchor_price,available,anchor_price_date,special_sale_type",
     }
     for kind, fields in fields_by_kind.items():

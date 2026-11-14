@@ -24,6 +24,11 @@ class Database(ABC):
     def import_transaction(self, source_date: date | None = None):
         raise NotImplementedError("Atomic imports require transaction support")
 
+    async def record_metadata_source_date(
+        self, table: str, ids: list[int], source: date
+    ) -> None:
+        raise NotImplementedError("Metadata provenance requires publication support")
+
     @abstractmethod
     async def connect(self) -> None:
         """Initialize the database connection."""

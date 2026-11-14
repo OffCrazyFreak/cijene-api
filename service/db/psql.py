@@ -151,9 +151,8 @@ class PostgresDatabase(Database):
             }
             if source_date is not None:
                 for table, columns in fields.items():
-                    identity = "store_id" if table == "stores" else "chain_product_id"
                     preserved[table] = await conn.fetch(
-                        f"SELECT id,{columns} FROM {table} m WHERE EXISTS(SELECT 1 FROM prices p WHERE p.{identity}=m.id AND p.price_date>$1)",
+                        f"SELECT id,{columns} FROM {table} m WHERE metadata_source_date>$1",
                         source_date,
                     )
             yield
@@ -169,6 +168,18 @@ class PostgresDatabase(Database):
                         [tuple(record) for record in records],
                     )
             await publish(conn)
+
+    async def record_metadata_source_date(
+        self, table: str, ids: list[int], source: date
+    ) -> None:
+        if table not in {"stores", "chain_products"} or self._import_conn.get() is None:
+            raise RuntimeError("Metadata provenance requires import_transaction")
+        async with self._get_conn() as conn:
+            await conn.execute(
+                f"UPDATE {table} SET metadata_source_date=greatest(metadata_source_date,$2::date) WHERE id=ANY($1::bigint[])",
+                ids,
+                source,
+            )
 
     async def close(self) -> None:
         """Close all database connections."""
@@ -276,6 +287,19 @@ class PostgresDatabase(Database):
             store.zipcode or None,
         )
 
+    @asynccontextmanager
+    async def _metadata_connection(self):
+        if self._import_conn.get() is not None:
+            async with self._get_conn() as conn:
+                yield conn
+            return
+        async with self._writer_transaction("metadata") as conn:
+            if await self.cleanup_is_protected():
+                raise RuntimeError(
+                    "Accepted metadata changes require import_transaction"
+                )
+            yield conn
+
     async def update_store(
         self,
         chain_id: int,
@@ -292,9 +316,7 @@ class PostgresDatabase(Database):
         Update store information by chain_id and store code.
         Returns True if the store was updated, False if not found.
         """
-        if self._import_conn.get() is None and await self.cleanup_is_protected():
-            raise RuntimeError("Accepted metadata changes require import_transaction")
-        async with self._get_conn() as conn:
+        async with self._metadata_connection() as conn:
             result = await conn.execute(
                 """
                 UPDATE stores
@@ -514,9 +536,7 @@ class PostgresDatabase(Database):
         Returns:
             True if the product was updated, False if not found.
         """
-        if self._import_conn.get() is None and await self.cleanup_is_protected():
-            raise RuntimeError("Accepted metadata changes require import_transaction")
-        async with self._get_conn() as conn:
+        async with self._metadata_connection() as conn:
             result = await conn.execute(
                 """
                 UPDATE products
