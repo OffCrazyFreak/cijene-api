@@ -166,6 +166,11 @@ BEGIN
             RAISE EXCEPTION 'immutable accepted generation';
         END IF;
     ELSE
+        PERFORM 1 FROM generations
+        WHERE id IN (
+            CASE WHEN TG_OP <> 'INSERT' THEN OLD.generation_id END,
+            CASE WHEN TG_OP <> 'DELETE' THEN NEW.generation_id END
+        ) ORDER BY id FOR UPDATE;
         IF TG_OP <> 'INSERT' THEN
             target := OLD.generation_id;
             IF EXISTS(SELECT 1 FROM generations WHERE id=target AND accepted_at IS NOT NULL) THEN

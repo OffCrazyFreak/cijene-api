@@ -267,3 +267,65 @@ def test_baseline_uses_lower_supplied_price(database, special):
                 assert stats["offer_count"] == 2
 
     asyncio.run(run())
+
+
+def test_acceptance_waits_for_membership_edits(database):
+    from tests.service.async_helpers import task_scope
+
+    async def run():
+        async with database() as db:
+            await legacy(db)
+            await db.create_tables()
+            async with db._get_conn() as editing, db._get_conn() as accepting:
+                generation = await editing.fetchval(
+                    "INSERT INTO generations(origin) VALUES('test') RETURNING id"
+                )
+                await editing.execute(
+                    "INSERT INTO generation_products SELECT $1,id,version_id FROM generation_products WHERE generation_id=(SELECT active_id FROM publication_state)",
+                    generation,
+                )
+                version = await editing.fetchval(
+                    "INSERT INTO product_versions(id,ean,name) VALUES(1,'123','Revised') RETURNING version_id"
+                )
+                async with editing.transaction():
+                    await editing.execute(
+                        "UPDATE generation_products SET version_id=$1 WHERE generation_id=$2",
+                        version,
+                        generation,
+                    )
+                    pid = await accepting.fetchval("SELECT pg_backend_pid()")
+                    async with task_scope() as workers:
+                        task = asyncio.create_task(
+                            accepting.execute(
+                                "UPDATE generations SET accepted_at=CURRENT_TIMESTAMP WHERE id=$1",
+                                generation,
+                            )
+                        )
+                        workers.append(task)
+                        async with db._get_conn() as observer:
+                            async with asyncio.timeout(5):
+                                while not task.done():
+                                    if await observer.fetchval(
+                                        "SELECT cardinality(pg_blocking_pids($1)) > 0",
+                                        pid,
+                                    ):
+                                        break
+                                else:
+                                    await task
+                                    pytest.fail(
+                                        "Acceptance committed before the membership edit"
+                                    )
+                        task.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await task
+                await accepting.execute(
+                    "UPDATE generations SET accepted_at=CURRENT_TIMESTAMP WHERE id=$1",
+                    generation,
+                )
+                with pytest.raises(Exception, match="immutable"):
+                    await editing.execute(
+                        "DELETE FROM generation_products WHERE generation_id=$1",
+                        generation,
+                    )
+
+    asyncio.run(run())
