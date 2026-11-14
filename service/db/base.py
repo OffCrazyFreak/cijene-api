@@ -353,6 +353,11 @@ class Database(ABC):
         pass
 
     @abstractmethod
+    async def cleanup_is_protected(self) -> bool:
+        """Whether accepted publication data prevents legacy cleanup."""
+        raise NotImplementedError
+
+    @abstractmethod
     async def count_prices_before(self, before: date) -> dict[date, int]:
         """
         Count the price rows that delete_prices_before() would delete.

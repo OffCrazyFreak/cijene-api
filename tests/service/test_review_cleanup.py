@@ -1,3 +1,4 @@
+import pytest
 import asyncio
 from datetime import date
 from unittest.mock import AsyncMock
@@ -51,5 +52,87 @@ def test_cleanup_keeps_raw_and_stats_dates(database, monkeypatch):
                     "SELECT cp.chain_id,p.price_date FROM prices p JOIN chain_products cp ON cp.id=p.chain_product_id"
                 )
             assert {(r["chain_id"], r["price_date"]) for r in rows} == expected
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("method", ["count_prices_before", "delete_prices_before"])
+def test_cleanup_holds_writer_lock(database, monkeypatch, method):
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            original = db._get_kept_chains
+            entered = asyncio.Event()
+            resume = asyncio.Event()
+
+            async def paused(before):
+                entered.set()
+                await resume.wait()
+                return await original(before)
+
+            monkeypatch.setattr(db, "_get_kept_chains", paused)
+            task = asyncio.create_task(getattr(db, method)(date(2027, 1, 1)))
+            await entered.wait()
+            try:
+                async with db._get_conn() as conn:
+                    async with conn.transaction():
+                        assert not await conn.fetchval(
+                            "SELECT pg_try_advisory_xact_lock(73198421)"
+                        )
+            finally:
+                resume.set()
+                await task
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cleanup_first", [True, False])
+def test_import_cleanup_interleaving(database, tmp_path, monkeypatch, cleanup_first):
+    from unittest.mock import patch
+    from tests.service.import_fixtures import importer, write_day
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            monkeypatch.setattr(db, "_vacuum_prices", AsyncMock())
+            reached = asyncio.Event()
+            release = asyncio.Event()
+            original = db._get_kept_chains
+
+            async def paused(before):
+                reached.set()
+                await release.wait()
+                return await original(before)
+
+            with patch.object(importer, "db", db):
+                if cleanup_first:
+                    monkeypatch.setattr(db, "_get_kept_chains", paused)
+                    cleanup = asyncio.create_task(
+                        db.delete_prices_before(date(2027, 1, 1))
+                    )
+                    await reached.wait()
+                    importing = asyncio.create_task(
+                        importer.import_directory(write_day(tmp_path), False)
+                    )
+                    async with db._get_conn() as conn:
+                        assert await conn.fetchval("SELECT count(*) FROM prices") == 0
+                    release.set()
+                    await asyncio.gather(cleanup, importing)
+                else:
+
+                    async def importing():
+                        async with db.import_transaction():
+                            reached.set()
+                            await release.wait()
+
+                    writer = asyncio.create_task(importing())
+                    await reached.wait()
+                    cleanup = asyncio.create_task(
+                        db.delete_prices_before(date(2027, 1, 1))
+                    )
+                    release.set()
+                    await asyncio.gather(writer, cleanup)
+                    await importer.import_directory(write_day(tmp_path), False)
+            assert await db._fetchval("SELECT count(*) FROM prices") == 1
 
     asyncio.run(run())

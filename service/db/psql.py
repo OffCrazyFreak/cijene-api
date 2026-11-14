@@ -18,6 +18,7 @@ from typing import (
 import asyncpg
 
 from .base import Database
+from .generations import backfill_legacy
 from .models import (
     Chain,
     ChainProduct,
@@ -135,11 +136,13 @@ class PostgresDatabase(Database):
 
             async with self._get_conn() as conn:
                 async with conn.transaction():
+                    await conn.execute("SELECT pg_advisory_xact_lock(73198421)")
                     await conn.execute(schema_sql)
                     for migration in sorted(
                         (Path(__file__).parent / "migrations").glob("*.sql")
                     ):
                         await conn.execute(migration.read_text())
+                    await backfill_legacy(conn)
                 self.logger.info("Database tables created successfully")
         except Exception as e:
             self.logger.error(f"Error creating tables: {e}")
@@ -979,7 +982,23 @@ class PostgresDatabase(Database):
         """
         return condition, [price_date, chain_ids]
 
+    async def cleanup_is_protected(self) -> bool:
+        return bool(
+            await self._fetchval(
+                "SELECT EXISTS(SELECT 1 FROM generations WHERE accepted_at IS NOT NULL)"
+            )
+        )
+
     async def count_prices_before(self, before: date) -> dict[date, int]:
+        async with self._writer_transaction("cleanup"):
+            if await self.cleanup_is_protected():
+                self.logger.warning(
+                    "Accepted generations protect all legacy prices; cleanup disabled"
+                )
+                return {}
+            return await self._count_prices_before(before)
+
+    async def _count_prices_before(self, before: date) -> dict[date, int]:
         kept = await self._get_kept_chains(before)
         counts: dict[date, int] = {}
         async for price_date in self._price_dates_before(before):
@@ -994,6 +1013,15 @@ class PostgresDatabase(Database):
         return counts
 
     async def delete_prices_before(self, before: date) -> dict[date, int]:
+        async with self._writer_transaction("cleanup"):
+            if await self.cleanup_is_protected():
+                raise RuntimeError("Accepted generations disable destructive cleanup")
+            deleted = await self._delete_prices_before(before)
+        if deleted:
+            await self._vacuum_prices(sum(deleted.values()))
+        return deleted
+
+    async def _delete_prices_before(self, before: date) -> dict[date, int]:
         kept = await self._get_kept_chains(before)
         deleted: dict[date, int] = {}
         async for price_date in self._price_dates_before(before):
@@ -1012,8 +1040,6 @@ class PostgresDatabase(Database):
             else:
                 self.logger.debug(f"{price_date}: no rows to delete")
 
-        if deleted:
-            await self._vacuum_prices(sum(deleted.values()))
         return deleted
 
     async def _vacuum_prices(self, deleted: int) -> None:
