@@ -2,6 +2,8 @@ import asyncio
 
 import pytest
 
+from tests.service.async_helpers import task_scope, wait_for_event
+
 
 def test_inherited_context_rejected_even_after_exit(database):
     async def run():
@@ -74,14 +76,30 @@ def test_independent_reader_sees_only_committed_rows(database):
                 assert await db._fetchval("SELECT count(*) FROM chains") == 0
                 read.set()
 
-            task = asyncio.create_task(reader())
-            async with db.import_transaction():
-                await db._fetchval(
-                    "INSERT INTO chains(code) VALUES('private') RETURNING id"
-                )
-                written.set()
-                await read.wait()
-            await task
+            async with task_scope() as workers:
+                task = asyncio.create_task(reader())
+                workers.append(task)
+                async with db.import_transaction():
+                    await db._fetchval(
+                        "INSERT INTO chains(code) VALUES('private') RETURNING id"
+                    )
+                    written.set()
+                    await wait_for_event(read, task)
+                await task
             assert await db._fetchval("SELECT count(*) FROM chains") == 1
+
+    asyncio.run(run())
+
+
+def test_handshake_propagates_worker_failure():
+    async def run():
+        async def fail():
+            raise ValueError("worker failed")
+
+        async with task_scope() as workers:
+            task = asyncio.create_task(fail())
+            workers.append(task)
+            with pytest.raises(ValueError, match="worker failed"):
+                await wait_for_event(asyncio.Event(), task)
 
     asyncio.run(run())
