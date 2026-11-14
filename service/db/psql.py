@@ -118,6 +118,30 @@ class PostgresDatabase(Database):
                     self._import_conn.reset(token)
 
     @asynccontextmanager
+    async def _cleanup_connection(self):
+        if self._import_conn.get() is not None:
+            raise RuntimeError("Nested writer transaction is unsupported")
+        async with self._get_conn() as conn:
+            token = None
+            try:
+                await conn.execute("SELECT pg_advisory_lock(73198421)")
+                token = self._import_conn.set(
+                    _TransactionContext(asyncio.current_task(), conn, "cleanup")
+                )
+                yield conn
+            finally:
+                if token is not None:
+                    self._import_conn.reset(token)
+                unlock = asyncio.create_task(
+                    conn.execute("SELECT pg_advisory_unlock(73198421)")
+                )
+                try:
+                    await asyncio.shield(unlock)
+                except asyncio.CancelledError:
+                    await unlock
+                    raise
+
+    @asynccontextmanager
     async def import_transaction(self):
         async with self._writer_transaction("import"):
             yield
@@ -1013,7 +1037,7 @@ class PostgresDatabase(Database):
         return counts
 
     async def delete_prices_before(self, before: date) -> dict[date, int]:
-        async with self._writer_transaction("cleanup"):
+        async with self._cleanup_connection():
             if await self.cleanup_is_protected():
                 raise RuntimeError("Accepted generations disable destructive cleanup")
             deleted = await self._delete_prices_before(before)
