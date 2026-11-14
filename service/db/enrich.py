@@ -295,10 +295,11 @@ async def main():
     await db.create_tables()
 
     try:
-        if args.products:
-            await enrich_products(args.csv_file)
-        elif args.stores:
-            await enrich_stores(args.csv_file)
+        async with db.import_transaction():
+            if args.products:
+                await enrich_products(args.csv_file)
+            elif args.stores:
+                await enrich_stores(args.csv_file)
     finally:
         await db.close()
 

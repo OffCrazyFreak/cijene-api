@@ -129,7 +129,7 @@ async def _import(
     with TemporaryDirectory() as directory:
         snapshot = Path(directory)
         prepare_input(path, snapshot)
-        async with db.import_transaction():
+        async with db.import_transaction(price_date):
             barcodes = await db.get_product_barcodes()
             for chain in sorted(snapshot.iterdir()):
                 if chain.is_dir():

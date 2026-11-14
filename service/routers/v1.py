@@ -2,11 +2,13 @@ import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from common.barcodes import normalize_barcode
 from service.config import settings
-from service.db.models import ChainStats, ProductWithId, StorePrice
+from service.db.models import ChainStats, StorePrice
+from service.db.search import directory, latest_prices, normalize, selection
 from service.routers.auth import RequireAuth
 
 router = APIRouter(tags=["Products, Chains and Stores"], dependencies=[RequireAuth])
@@ -22,8 +24,8 @@ class ListChainsResponse(BaseModel):
 @router.get("/chains/", summary="List retail chains")
 async def list_chains() -> ListChainsResponse:
     """List all available chains."""
-    chains = await db.list_chains()
-    return ListChainsResponse(chains=[chain.code for chain in chains])
+    chains = await directory(db, "chain")
+    return ListChainsResponse(chains=[chain["code"] for chain in chains])
 
 
 class StoreResponse(BaseModel):
@@ -61,25 +63,29 @@ async def list_stores(chain_code: str) -> ListStoresResponse:
 
     Future plan: Allow filtering by store type and location.
     """
-    stores = await db.list_stores(chain_code)
-
+    rows = await directory(db, "store")
+    stores = {r["code"]: r for r in rows if r["chain"] == chain_code}
     if not stores:
-        raise HTTPException(status_code=404, detail=f"No chain {chain_code}")
-
+        raise HTTPException(404, "No stores for chain")
     return ListStoresResponse(
         stores=[
             StoreResponse(
-                chain_code=chain_code,
-                code=store.code,
-                type=store.type,
-                address=store.address,
-                city=store.city,
-                zipcode=store.zipcode,
-                lat=store.lat,
-                lon=store.lon,
-                phone=store.phone,
+                chain_code=r["chain"],
+                code=r["code"],
+                **{
+                    k: r[k]
+                    for k in (
+                        "type",
+                        "address",
+                        "city",
+                        "zipcode",
+                        "lat",
+                        "lon",
+                        "phone",
+                    )
+                },
             )
-            for store in stores
+            for r in stores.values()
         ]
     )
 
@@ -118,55 +124,69 @@ async def search_stores(
     Note that the geolocation search will only return stores that have
     the geo information available in the database.
     """
-    # Validate lat/lon parameters
-    if (lat is None) != (lon is None):
-        raise HTTPException(
-            status_code=400,
-            detail="Both latitude and longitude must be provided for geolocation search",
-        )
-
-    # Parse chain codes
-    chain_codes = None
-    if chains:
-        chain_codes = [c.strip().lower() for c in chains.split(",") if c.strip()]
-
+    rows = await directory(db, "store")
     try:
-        stores = await db.filter_stores(
-            chain_codes=chain_codes,
-            city=city,
-            address=address,
-            lat=lat,
-            lon=lon,
-            d=d,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Get chain code mapping for response
-    chains_map = {}
-    if stores:
-        all_chains = await db.list_chains()
-        chains_map = {chain.id: chain.code for chain in all_chains}
-
+        rows = filter_location(rows, chains, city, address, lat, lon, d)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    stores = {(r["chain"], r["code"]): r for r in rows}
     return ListStoresResponse(
         stores=[
             StoreResponse(
-                chain_code=chains_map.get(store.chain_id, "unknown"),
-                code=store.code,
-                type=store.type,
-                address=store.address,
-                city=store.city,
-                zipcode=store.zipcode,
-                lat=store.lat,
-                lon=store.lon,
-                phone=store.phone,
+                chain_code=r["chain"],
+                code=r["code"],
+                **{
+                    k: r[k]
+                    for k in (
+                        "type",
+                        "address",
+                        "city",
+                        "zipcode",
+                        "lat",
+                        "lon",
+                        "phone",
+                    )
+                },
             )
-            for store in stores
+            for r in stores.values()
         ]
     )
 
 
+def filter_location(rows, chains, city, address, lat, lon, distance):
+    import math
+
+    if (lat is None) != (lon is None):
+        raise ValueError("Both latitude and longitude are required")
+    if distance < 0:
+        raise ValueError("Distance must be nonnegative")
+    selected = selection(chains)
+    result = []
+    for row in rows:
+        if selected and normalize(row["chain"]) not in selected:
+            continue
+        if city and normalize(city) not in normalize(row["city"] or ""):
+            continue
+        if address and normalize(address) not in normalize(row["address"] or ""):
+            continue
+        if lat is not None:
+            if row["lat"] is None or row["lon"] is None:
+                continue
+            a = math.sin(math.radians(row["lat"] - lat) / 2) ** 2
+            a += (
+                math.cos(math.radians(lat))
+                * math.cos(math.radians(row["lat"]))
+                * math.sin(math.radians(row["lon"] - lon) / 2) ** 2
+            )
+            if 6371 * 2 * math.asin(min(1, math.sqrt(a))) > distance:
+                continue
+        result.append(row)
+    return result
+
+
 class ChainProductResponse(BaseModel):
+    model_config = {"extra": "allow"}
+
     """Chain product with price information response schema."""
 
     chain: str = Field(..., description="Chain code.")
@@ -185,6 +205,8 @@ class ChainProductResponse(BaseModel):
 
 
 class ProductResponse(BaseModel):
+    model_config = {"extra": "allow"}
+
     """Basic product information response schema."""
 
     ean: str = Field(..., description="EAN barcode of the product.")
@@ -198,85 +220,18 @@ class ProductResponse(BaseModel):
 
 
 class ProductSearchResponse(BaseModel):
+    model_config = {"extra": "allow"}
+
     products: list[ProductResponse] = Field(
         ..., description="List of products matching the search query."
     )
 
 
-async def prepare_product_response(
-    products: list[ProductWithId],
-    date: datetime.date | None,
-    filtered_chains: list[str] | None,
-) -> list[ProductResponse]:
-    chains = await db.list_chains()
-    if filtered_chains:
-        chains = [c for c in chains if c.code in filtered_chains]
-    chain_id_to_code = {chain.id: chain.code for chain in chains}
-
-    if not date:
-        date = datetime.date.today()
-
-    product_ids = [product.id for product in products]
-
-    chain_products = await db.get_chain_products_for_product(
-        product_ids,
-        [chain.id for chain in chains],
-    )
-
-    product_response_map = {
-        product.id: ProductResponse(
-            ean=product.ean,
-            brand=product.brand or "",
-            name=product.name or "",
-            quantity=str(product.quantity) if product.quantity else None,
-            unit=product.unit,
-            chains=[],
-        )
-        for product in products
-    }
-
-    cpr_map = {}
-    for cp in chain_products:
-        product_id = cp.product_id
-        chain = chain_id_to_code[cp.chain_id]
-
-        cpr_data = cp.to_dict()
-        cpr_data["chain"] = chain
-        cpr_map[(product_id, chain)] = cpr_data
-
-    prices = await db.get_product_prices(product_ids, date)
-    for p in prices:
-        product_id = p["product_id"]
-        chain = p["chain"]
-        cpr_data = cpr_map.get((product_id, chain))
-        if not cpr_data:
-            continue
-
-        cpr_data["min_price"] = p["min_price"]
-        cpr_data["max_price"] = p["max_price"]
-        cpr_data["avg_price"] = p["avg_price"]
-        cpr_data["price_date"] = p["price_date"]
-        product_response_map[product_id].chains.append(ChainProductResponse(**cpr_data))
-
-    # Fixup global product brand and name using chain data
-    # Logic here is that the longest string is the most likely to be most useful
-    for product in product_response_map.values():
-        if not product.brand:
-            chain_brands = [cpr.brand for cpr in product.chains if cpr.brand]
-            chain_brands.sort(key=lambda x: len(x))
-            if chain_brands:
-                product.brand = chain_brands[0].capitalize()
-
-        if not product.name:
-            chain_names = [cpr.name for cpr in product.chains if cpr.name]
-            chain_names.sort(key=lambda x: len(x), reverse=True)
-            if chain_names:
-                product.name = chain_names[0].capitalize()
-
-    return [p for p in product_response_map.values() if p.chains]
-
-
-@router.get("/products/{ean}/", summary="Get product data/prices by barcode")
+@router.get(
+    "/products/{ean}/",
+    summary="Get product data/prices by barcode",
+    response_model=ProductResponse,
+)
 async def get_product(
     ean: str,
     date: datetime.date = Query(
@@ -287,41 +242,32 @@ async def get_product(
         None,
         description="Comma-separated list of chain codes to include",
     ),
-) -> ProductResponse:
+    city: str | None = Query(None),
+    brand: str | None = Query(None),
+    category: str | None = Query(None),
+) -> dict:
     """
     Get product information including chain products and prices by their
     barcode. For products that don't have official EAN codes and use
     chain-specific codes, use the "chain:<product_code>" format.
 
-    The price information is for the last known date earlier than or
-    equal to the specified date. If no date is provided, current date is used.
+    Prices are the latest dated observations in one accepted generation.
+    Explicit historical dates are rejected.
     """
 
-    # Strip leading zeros so a padded query (0000054490970) finds the
-    # canonical row stored bare (54490970); synthetic chain:code is left as-is.
-    products = await db.get_products_by_ean([normalize_barcode(ean) or ean])
-    if not products:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Product with EAN {ean} not found",
+    from service.db.search import search
+
+    if date is not None:
+        raise HTTPException(400, "Historical dates are unsupported on latest routes")
+    try:
+        result = await search(
+            db, identity=ean, chains=chains, city=city, brand=brand, category=category
         )
-
-    product_responses = await prepare_product_response(
-        products=products,
-        date=date,
-        filtered_chains=(
-            [c.lower().strip() for c in chains.split(",")] if chains else None
-        ),
-    )
-
-    if not product_responses:
-        with_chains = " with specified chains" if chains else ""
-        raise HTTPException(
-            status_code=404,
-            detail=f"No product information found for EAN {ean}{with_chains}",
-        )
-
-    return product_responses[0]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not result["products"]:
+        raise HTTPException(404, "Product not found in scope")
+    return jsonable_encoder(result["products"][0], custom_encoder={Decimal: str})
 
 
 class StorePricesResponse(BaseModel):
@@ -360,7 +306,7 @@ async def get_prices(
         10.0,
         description="Distance in kilometers for geolocation search (default: 10.0)",
     ),
-) -> StorePricesResponse:
+) -> dict:
     """
     Get product prices by store with store filtering capabilities.
 
@@ -368,133 +314,98 @@ async def get_prices(
     For geolocation search, both lat and lon must be provided together.
     The EANs parameter is required and must contain at least one EAN code.
     """
-    # Validate EANs parameter
-    if not eans or not eans.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="EANs parameter is required and must be non-empty",
+    wanted = {
+        normalize_barcode(e.strip()) or e.strip() for e in eans.split(",") if e.strip()
+    }
+    if not wanted:
+        raise HTTPException(400, "EANs must be non-empty")
+    try:
+        rows = filter_location(
+            await latest_prices(db), chains, city, address, lat, lon, d
         )
-
-    # Parse EAN codes, stripping leading zeros so padded queries resolve to the
-    # canonical (bare) rows stored in the DB.
-    ean_list = [
-        normalize_barcode(s) or s for s in (e.strip() for e in eans.split(",")) if s
-    ]
-    if not ean_list:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one valid EAN code must be provided",
-        )
-
-    # Validate lat/lon parameters
-    if (lat is None) != (lon is None):
-        raise HTTPException(
-            status_code=400,
-            detail="Both latitude and longitude must be provided for geolocation search",
-        )
-
-    # Get products by EANs
-    products = await db.get_products_by_ean(ean_list)
-    if not products:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No products found for the provided EANs: {eans}",
-        )
-
-    # Parse chain codes for store filtering
-    chain_codes = None
-    if chains:
-        chain_codes = [c.strip().lower() for c in chains.split(",") if c.strip()]
-
-    # Filter stores if any filter criteria are provided
-    if chain_codes or city or address or lat or lon:
-        try:
-            filtered_stores = await db.filter_stores(
-                chain_codes=chain_codes,
-                city=city,
-                address=address,
-                lat=lat,
-                lon=lon,
-                d=d,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        store_ids = [store.id for store in filtered_stores]
-    else:
-        # If no filters are applied, get all stores
-        store_ids = None
-
-    store_prices = await db.get_product_store_prices(
-        product_ids=[product.id for product in products],
-        store_ids=store_ids,
-    )
-    return StorePricesResponse(store_prices=store_prices)
-
-
-@router.get("/products/", summary="Search for products by name")
-async def search_products(
-    q: str = Query(..., description="Search query for product names"),
-    date: datetime.date = Query(
-        None,
-        description="Date in YYYY-MM-DD format, defaults to today",
-    ),
-    chains: str = Query(
-        None,
-        description=(
-            "Comma-separated list of chain codes to include "
-            "(applied before the result limit)"
-        ),
-    ),
-    fuzzy: bool = Query(
-        False,
-        description="Use fuzzy search, defaults to false (exact matches only)",
-    ),
-    limit: int = Query(
-        20,
-        ge=1,
-        le=100,
-        description="Maximum number of results to return (1-100, default 20)",
-    ),
-) -> ProductSearchResponse:
-    """
-    Search for products by name and brand.
-
-    Returns a list of products that match the search query. Matching is
-    case- and diacritic-insensitive. If chains are specified, only products
-    matching within those chains are searched, and the limit applies to the
-    filtered result set. Only products that have price data for the
-    requested date (defaulting to today) are returned.
-    """
-    if not q.strip():
-        return ProductSearchResponse(products=[])
-
-    filtered_chains = [c.lower().strip() for c in chains.split(",")] if chains else None
-
-    chain_ids = None
-    if filtered_chains is not None:
-        chain_ids = [
-            chain.id
-            for chain in await db.list_chains()
-            if chain.code in filtered_chains
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    response = {
+        "store_prices": [
+            {
+                **{
+                    k: r[k]
+                    for k in (
+                        "ean",
+                        "chain",
+                        "price_date",
+                        "regular_price",
+                        "special_price",
+                        "unit_price",
+                        "best_price_30",
+                        "anchor_price",
+                    )
+                },
+                "listing_status": r["listing_status"],
+                "store": {
+                    "chain_id": r["chain_id"],
+                    "code": r["store_code"],
+                    **{
+                        k: r[k]
+                        for k in (
+                            "type",
+                            "address",
+                            "city",
+                            "zipcode",
+                            "lat",
+                            "lon",
+                            "phone",
+                        )
+                    },
+                },
+            }
+            for r in rows
+            if r["ean"] in wanted
         ]
+    }
 
-    # Resolve the effective date once so the search and the price lookup in
-    # prepare_product_response() use the same date even across midnight.
-    effective_date = date or datetime.date.today()
+    return jsonable_encoder(response, custom_encoder={Decimal: str})
 
-    if fuzzy:
-        products = await db.fuzzy_search_products(q, limit, chain_ids, effective_date)
-    else:
-        products = await db.search_products(q, limit, chain_ids, effective_date)
 
-    product_responses = await prepare_product_response(
-        products=products,
-        date=effective_date,
-        filtered_chains=filtered_chains,
-    )
+@router.get(
+    "/products/",
+    summary="Search complete latest product offers",
+    response_model=ProductSearchResponse,
+)
+async def search_products(
+    q: str = Query(""),
+    date: datetime.date | None = Query(None),
+    chains: str | None = Query(None),
+    city: str | None = Query(None),
+    brand: str | None = Query(None),
+    category: str | None = Query(None),
+    order: str = Query("relevance"),
+    fuzzy: bool = Query(False, deprecated=True),
+    page_size: int | None = Query(None, ge=1, le=10000),
+    limit: int | None = Query(None, ge=1, le=10000, deprecated=True),
+    cursor: str | None = Query(None),
+) -> dict:
+    from service.db.search import search
 
-    return ProductSearchResponse(products=product_responses)
+    if date is not None:
+        raise HTTPException(400, "Historical dates are unsupported on latest routes")
+    if page_size is not None and limit is not None and page_size != limit:
+        raise HTTPException(400, "Conflicting page_size and limit")
+    try:
+        result = await search(
+            db,
+            q=q,
+            chains=chains,
+            city=city,
+            brand=brand,
+            category=category,
+            order=order,
+            page_size=page_size or limit or 100,
+            cursor=cursor,
+        )
+        return jsonable_encoder(result, custom_encoder={Decimal: str})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 class ChainStatsResponse(BaseModel):
@@ -502,8 +413,22 @@ class ChainStatsResponse(BaseModel):
 
 
 @router.get("/chain-stats/", summary="Return stats of currently loaded data per chain.")
-async def chain_stats() -> ChainStatsResponse:
+async def chain_stats() -> dict:
     """Return stats of currently loaded data per chain."""
 
-    chain_stats = await db.list_latest_chain_stats()
-    return ChainStatsResponse(chain_stats=chain_stats)
+    rows = await latest_prices(db)
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["chain"], []).append(row)
+    return {
+        "chain_stats": [
+            {
+                "chain_code": chain,
+                "price_date": max(r["price_date"] for r in offers),
+                "price_count": len(offers),
+                "store_count": len({r["store_code"] for r in offers}),
+                "created_at": datetime.datetime.now(datetime.timezone.utc),
+            }
+            for chain, offers in sorted(groups.items())
+        ]
+    }

@@ -21,7 +21,7 @@ from .models import (
 class Database(ABC):
     """Base abstract class for database implementations."""
 
-    def import_transaction(self):
+    def import_transaction(self, source_date: date | None = None):
         raise NotImplementedError("Atomic imports require transaction support")
 
     @abstractmethod

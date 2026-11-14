@@ -11,7 +11,10 @@ def test_authenticated_response_uses_real_database(database, service_client):
                     await conn.execute(
                         "INSERT INTO users (name, api_key) VALUES ('test', $1)", token
                     )
-                    await conn.execute("INSERT INTO chains (code) VALUES ('fixture')")
+                async with db.import_transaction():
+                    await db._fetchval(
+                        "INSERT INTO chains (code) VALUES ('fixture') RETURNING id"
+                    )
                 for headers in ({}, {"Authorization": "Bearer invalid"}):
                     response = await client.get("/v1/chains/", headers=headers)
                     assert response.status_code == 403

@@ -18,7 +18,7 @@ from typing import (
 import asyncpg
 
 from .base import Database
-from .generations import backfill_legacy
+from .generations import backfill_legacy, publish
 from .models import (
     Chain,
     ChainProduct,
@@ -142,9 +142,33 @@ class PostgresDatabase(Database):
                     raise
 
     @asynccontextmanager
-    async def import_transaction(self):
-        async with self._writer_transaction("import"):
+    async def import_transaction(self, source_date: date | None = None):
+        async with self._writer_transaction("import") as conn:
+            preserved = {}
+            fields = {
+                "stores": "chain_id,code,type,address,city,zipcode,lat,lon,phone",
+                "chain_products": "chain_id,product_id,code,brand,name,category,unit,quantity",
+            }
+            if source_date is not None:
+                for table, columns in fields.items():
+                    identity = "store_id" if table == "stores" else "chain_product_id"
+                    preserved[table] = await conn.fetch(
+                        f"SELECT id,{columns} FROM {table} m WHERE EXISTS(SELECT 1 FROM prices p WHERE p.{identity}=m.id AND p.price_date>$1)",
+                        source_date,
+                    )
             yield
+            for table, records in preserved.items():
+                columns = fields[table].split(",")
+                if records:
+                    await conn.executemany(
+                        f"UPDATE {table} SET "
+                        + ",".join(
+                            f"{column}=${i}" for i, column in enumerate(columns, 2)
+                        )
+                        + " WHERE id=$1",
+                        [tuple(record) for record in records],
+                    )
+            await publish(conn)
 
     async def close(self) -> None:
         """Close all database connections."""
@@ -268,6 +292,8 @@ class PostgresDatabase(Database):
         Update store information by chain_id and store code.
         Returns True if the store was updated, False if not found.
         """
+        if self._import_conn.get() is None and await self.cleanup_is_protected():
+            raise RuntimeError("Accepted metadata changes require import_transaction")
         async with self._get_conn() as conn:
             result = await conn.execute(
                 """
@@ -488,6 +514,8 @@ class PostgresDatabase(Database):
         Returns:
             True if the product was updated, False if not found.
         """
+        if self._import_conn.get() is None and await self.cleanup_is_protected():
+            raise RuntimeError("Accepted metadata changes require import_transaction")
         async with self._get_conn() as conn:
             result = await conn.execute(
                 """
