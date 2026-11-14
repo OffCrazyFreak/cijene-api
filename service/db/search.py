@@ -260,7 +260,22 @@ async def search(
     page_size: int = 100,
     cursor: str | None = None,
     identity: str | None = None,
+    city_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if city_labels is not None and (
+        not isinstance(city_labels, dict)
+        or len(city_labels) > 1000
+        or any(
+            not isinstance(k, str)
+            or not isinstance(v, str)
+            or not k.strip()
+            or not v.strip()
+            or len(k) > 256
+            or len(v) > 256
+            for k, v in city_labels.items()
+        )
+    ):
+        raise ValueError("Invalid city labels")
     if len(q) > MAX_QUERY_LENGTH:
         raise ValueError("Text search supports at most 256 characters")
     if order not in {"relevance", "price_asc", "price_desc"}:
@@ -277,6 +292,7 @@ async def search(
         sorted(selection(category)),
         order,
         identity,
+        sorted((city_labels or {}).items()),
     ]
     scope = hashlib.sha256(json.dumps(scope_data).encode()).hexdigest()
     decoded = decode_cursor(cursor) if cursor else None
@@ -310,6 +326,7 @@ async def search(
                     order,
                     page_size,
                     identity,
+                    city_labels,
                 )
     return evaluate(
         [],
@@ -556,6 +573,7 @@ async def serving_search(
     order: str,
     page_size: int,
     identity: str | None,
+    city_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     metadata = await conn.fetch(
         """
@@ -637,10 +655,16 @@ async def serving_search(
     facets = {}
     for facet in filters:
         predicate = " AND ".join(v for k, v in clauses.items() if k != facet)
+        value = (
+            f"COALESCE((${len(args) + 1}::jsonb)->>city,city)"
+            if facet == "city"
+            else facet
+        )
+        facet_args = [*args, json.dumps(city_labels or {})] if facet == "city" else args
         records = await conn.fetch(
             accepted
-            + f"SELECT {facet} value,count(DISTINCT ean) count FROM matching WHERE {predicate} AND {facet} IS NOT NULL AND {facet}<>'' GROUP BY {facet} ORDER BY {facet}",
-            *args[:3] if len(args) == 3 else args,
+            + f"SELECT {value} value,count(DISTINCT ean) count FROM matching WHERE {predicate} AND {facet} IS NOT NULL AND {facet}<>'' GROUP BY {value} ORDER BY {value}",
+            *facet_args,
         )
         facets[facet] = {r["value"]: r["count"] for r in records}
     outside = await conn.fetchval(

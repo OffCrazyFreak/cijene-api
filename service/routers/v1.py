@@ -1,4 +1,5 @@
 import datetime
+import json
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -385,6 +386,7 @@ async def search_products(
     date: datetime.date | None = Query(None),
     chains: str | None = Query(None),
     city: str | None = Query(None),
+    city_labels: str | None = Query(None, max_length=16384),
     brand: str | None = Query(None),
     category: str | None = Query(None),
     order: str = Query("relevance"),
@@ -405,6 +407,7 @@ async def search_products(
             q=q,
             chains=chains,
             city=city,
+            city_labels=json.loads(city_labels) if city_labels is not None else None,
             brand=brand,
             category=category,
             order=order,

@@ -229,3 +229,46 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                 )
 
     asyncio.run(run())
+
+
+def test_city_alias_facets_keep_labels_and_unique_products(database, service_client):
+    import asyncio
+    import json
+    from tests.service.test_generation_migration import legacy
+
+    async def run():
+        async with database() as db:
+            await legacy(db)
+            async with db._get_conn() as conn:
+                await conn.execute(
+                    "UPDATE stores SET city=CASE id WHEN 1 THEN '6C KRK' ELSE 'KRK' END"
+                )
+            async with service_client(db) as client:
+                async with db._get_conn() as conn:
+                    await conn.execute(
+                        "INSERT INTO users(name,api_key) VALUES('alias','alias-fixture')"
+                    )
+                labels = json.dumps({"6C KRK": "Krk", "KRK": "Krk"})
+                response = await client.get(
+                    "/v1/products/",
+                    params={
+                        "q": "Corrected",
+                        "city": "6C KRK,KRK",
+                        "city_labels": labels,
+                    },
+                    headers={"Authorization": "Bearer alias-fixture"},
+                )
+                assert response.status_code == 200
+                data = response.json()
+                assert data["facets"]["city"] == {"Krk": 1}
+                assert data["total"] == 1
+                assert data["products"][0]["shop_count"] == 2
+                for invalid in ["not-json", "[]", '{"KRK": 4}']:
+                    invalid_response = await client.get(
+                        "/v1/products/",
+                        params={"q": "Corrected", "city_labels": invalid},
+                        headers={"Authorization": "Bearer alias-fixture"},
+                    )
+                    assert invalid_response.status_code == 400
+
+    asyncio.run(run())
