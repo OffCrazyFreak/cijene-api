@@ -57,14 +57,33 @@ CREATE EXTENSION IF NOT EXISTS earthdistance;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
--- Create immutable wrapper for unaccent function (needed for indexes)
-CREATE OR REPLACE FUNCTION immutable_unaccent(text)
-RETURNS text
-LANGUAGE sql
-IMMUTABLE PARALLEL SAFE STRICT
-AS $function$
-    SELECT unaccent('unaccent', $1)
-$function$;
+-- Resolve extension objects independently of the caller's search path.
+DO $bootstrap$
+DECLARE
+    extension_schema text;
+BEGIN
+    SELECT n.nspname INTO STRICT extension_schema
+    FROM pg_catalog.pg_extension AS e
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = e.extnamespace
+    WHERE e.extname = 'unaccent';
+
+    EXECUTE pg_catalog.format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION immutable_unaccent(text)
+        RETURNS text
+        LANGUAGE sql
+        IMMUTABLE PARALLEL SAFE STRICT
+        SET search_path = pg_catalog
+        AS %L
+        $ddl$,
+        pg_catalog.format(
+            'SELECT %I.unaccent(%L::pg_catalog.regdictionary, $1)',
+            extension_schema,
+            pg_catalog.format('%I.unaccent', extension_schema)
+        )
+    );
+END
+$bootstrap$;
 ALTER TABLE stores
 ADD COLUMN IF NOT EXISTS earth_point earth GENERATED ALWAYS AS (ll_to_earth (lat, lon)) STORED;
 CREATE INDEX IF NOT EXISTS idx_stores_earth_point ON stores USING GIST (earth_point);
