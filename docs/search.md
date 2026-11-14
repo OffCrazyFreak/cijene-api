@@ -35,3 +35,5 @@ PostgreSQL filters, deduplicates physical shops, computes facets and aggregates 
 Migration 003 records metadata source dates independently of offer dates for stores and source products, including immutable versions. Existing metadata dates remain NULL because historical price dates cannot establish metadata provenance. Imports stamp only supplied metadata and preserve newer dated metadata within the same writer transaction. Direct metadata updates serialize their publication guard and update under the publication writer lock.
 
 Ordinary search text is limited to 256 characters. Fuzzy matching rejects impossible token-length differences before distance evaluation and uses a bounded adjacent-transposition recurrence, including transpositions combined with another edit.
+
+Clients may supply a bounded `city_labels` JSON object mapping raw source cities to display labels. City facets count distinct products across each mapped label, while actual offer filtering still uses the explicit raw city scope. Label mappings are included in the cursor scope fingerprint.
