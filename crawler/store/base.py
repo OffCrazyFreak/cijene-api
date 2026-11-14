@@ -144,6 +144,9 @@ class BaseCrawler:
     A date the chain publishes per product takes precedence.
     """
 
+    ANCHOR_PRICE_COLUMN_DATES: dict[str, datetime.date | None] = {}
+    """Dates established for individual source columns, overriding the chain default."""
+
     TRUE_VALUES = frozenset({"dostupno", "dostupan", "da", "d", "1", "true", "yes"})
     FALSE_VALUES = frozenset(
         {"nedostupno", "nedostupan", "ne", "n", "0", "false", "no"}
@@ -159,6 +162,10 @@ class BaseCrawler:
         # The maps and column lists are class attributes and nothing mutates
         # them at runtime, so the lowercased lookup keys are computed once here
         # rather than per row or per file.
+        self._anchor_column_dates = {
+            column.lower(): value
+            for column, value in self.ANCHOR_PRICE_COLUMN_DATES.items()
+        }
         self._price_specs = self._compile_map(self.PRICE_MAP)
         self._field_specs = self._compile_map(self.FIELD_MAP)
         self._bool_specs = self._compile_map(self.BOOL_MAP)
@@ -735,13 +742,14 @@ class BaseCrawler:
                 data["price"] = data["special_price"]
 
         # A date published per product wins over the one stated in the header
+        header_date = data.pop("_anchor_header_date", self.ANCHOR_PRICE_DATE)
         source_date = self.parse_anchor_date(data.get("anchor_price_date") or "")
         if data.get("anchor_price") is None:
             data["anchor_price_date"] = None
         elif source_date:
             data["anchor_price_date"] = source_date
-        elif self.ANCHOR_PRICE_DATE:
-            data["anchor_price_date"] = self.ANCHOR_PRICE_DATE.isoformat()
+        elif header_date:
+            data["anchor_price_date"] = header_date.isoformat()
         else:
             data["anchor_price_date"] = None
 
@@ -765,7 +773,12 @@ class BaseCrawler:
         # Candidate keys are tried in order and matched on presence, so an empty
         # value in the first one doesn't fall through and read another column.
         for field, names, keys, is_required in self._price_specs:
-            value = next((row[key] for key in keys if key in row), None)
+            source_column = next((key for key in keys if key in row), None)
+            value = row[source_column] if source_column is not None else None
+            if field == "anchor_price":
+                data["_anchor_header_date"] = self._anchor_column_dates.get(
+                    source_column, self.ANCHOR_PRICE_DATE
+                )
             try:
                 data[field] = self.parse_price(value, is_required)
             except ValueError as err:

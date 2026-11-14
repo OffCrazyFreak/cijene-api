@@ -1,11 +1,14 @@
 """Tests for where the anchor price date comes from: the product, the header, or nowhere."""
 
 import datetime
+from decimal import Decimal
 
 import pytest
 
 from crawler.store.base import BaseCrawler
 from crawler.store.roto import RotoCrawler
+from crawler.store.plodine import PlodineCrawler
+from crawler.store.gavranovic import GavranovicCrawler
 
 
 class _Crawler(BaseCrawler):
@@ -73,3 +76,56 @@ def test_roto_falls_back_to_the_newer_anchor_price():
 
     assert (str(old.anchor_price), old.anchor_price_date) == ("1.09", "2025-05-02")
     assert (str(new.anchor_price), new.anchor_price_date) == ("0.95", "2026-09-10")
+
+
+class _RowDatedPlodineCrawler(PlodineCrawler):
+    FIELD_MAP = {**PlodineCrawler.FIELD_MAP, "anchor_price_date": ("Datum", False)}
+
+
+class _RowDatedGavranovicCrawler(GavranovicCrawler):
+    FIELD_MAP = {**GavranovicCrawler.FIELD_MAP, "anchor_price_date": ("Datum", False)}
+
+
+@pytest.mark.parametrize(
+    "crawler_class", [_RowDatedPlodineCrawler, _RowDatedGavranovicCrawler]
+)
+@pytest.mark.parametrize(
+    "variant",
+    ["old", "new", "both", "empty", "explicit", "explicit-new", "empty-explicit"],
+)
+def test_selected_anchor_column_date(crawler_class, variant):
+    crawler = crawler_class()
+    row = {
+        "Naziv proizvoda": "Milk",
+        "Sifra proizvoda": "1",
+        "Šifra proizvoda": "1",
+        "Barkod": "123",
+        "Maloprodajna cijena": "2",
+        "Cijena po JM": "2",
+        "Cijena za jedinicu mjere": "2",
+    }
+    old = "Sidrena cijena na 2.5.2025"
+    new = (
+        "Sidrena cijena"
+        if crawler.CHAIN == "plodine"
+        else "Sidrena cijena na 10.09.2026"
+    )
+    if variant not in ("new", "explicit-new"):
+        row[old] = "" if variant in ("empty", "empty-explicit") else "1"
+    if variant in ("new", "both", "empty", "explicit-new"):
+        row[new] = "1.5"
+    if variant in ("explicit", "explicit-new", "empty-explicit"):
+        row["Datum"] = "27.04.2026"
+    product = crawler.parse_csv_row(row)
+    assert product.anchor_price_date == (
+        "2026-04-27"
+        if variant in ("explicit", "explicit-new")
+        else "2025-05-02"
+        if variant in ("old", "both")
+        else None
+    )
+    assert product.anchor_price == (
+        None
+        if variant in ("empty", "empty-explicit")
+        else Decimal("1.5" if variant in ("new", "explicit-new") else "1")
+    )

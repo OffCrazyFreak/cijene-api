@@ -38,6 +38,10 @@ class PlodineCrawler(BaseCrawler):
     FILE_TIMESTAMP_PATTERN = re.compile(r"_(\d{14})\.csv$")
     VERIFY_TLS_CERT = False  # Plodine uses a root CA unsupported by httpx on Debian 12
 
+    ANCHOR_PRICE_COLUMN_DATES = {
+        "Sidrena cijena na 2.5.2025": datetime.date(2025, 5, 2),
+    }
+
     PRICE_MAP = {
         "price": (["Maloprodajna cijena", "MPC"], False),
         "unit_price": ("Cijena po JM", False),
