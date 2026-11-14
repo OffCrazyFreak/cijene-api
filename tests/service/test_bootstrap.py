@@ -6,10 +6,10 @@ import pytest
 async def assert_index(db):
     async with db._get_conn() as conn:
         await conn.execute("""
-            INSERT INTO chains (code) VALUES ('index-fixture');
+            INSERT INTO chains (code) VALUES ('index-fixture') ON CONFLICT DO NOTHING;
             INSERT INTO chain_products (chain_id, code, name)
             SELECT id, 'milk', 'Mlijeko čokoladno' FROM chains
-            WHERE code = 'index-fixture';
+            WHERE code = 'index-fixture' ON CONFLICT DO NOTHING;
             SET enable_seqscan = off;
         """)
         plan = await conn.fetchval("""
@@ -42,6 +42,7 @@ def test_fresh_repeated_and_old_wrapper_upgrade(database):
         async with database() as db:
             await db.create_tables()
             await db.create_tables()
+            await assert_index(db)
             async with db._get_conn() as conn:
                 await conn.execute("""
                     CREATE OR REPLACE FUNCTION immutable_unaccent(text)

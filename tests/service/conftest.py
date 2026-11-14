@@ -1,6 +1,6 @@
-"""Opt-in real service tests; TEST_DATABASE_DSN must name a disposable server."""
+"""Opt-in integration tests against an explicitly selected disposable server."""
 
-import os
+import asyncio
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -10,24 +10,53 @@ import pytest
 from service.db.psql import PostgresDatabase
 
 
+class ServiceTestDatabase(PostgresDatabase):
+    def __init__(self, dsn, database_name):
+        super().__init__(dsn, 1, 3)
+        self.database_name = database_name
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=self.dsn,
+            database=self.database_name,
+            min_size=self.min_size,
+            max_size=self.max_size,
+        )
+
+
+async def cleanup_database(admin, db, name):
+    try:
+        if db is not None:
+            await db.close()
+    finally:
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
 @pytest.fixture
-def database():
+def database(request):
     @asynccontextmanager
     async def create():
-        dsn = os.environ.get("TEST_DATABASE_DSN")
+        dsn = request.config.getoption("--service-test-dsn")
         if not dsn:
-            pytest.skip("set TEST_DATABASE_DSN to run PostgreSQL integration tests")
-        admin = await asyncpg.connect(dsn)
+            pytest.skip("pass --service-test-dsn to run PostgreSQL integration tests")
         name = "test_" + uuid4().hex
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        db = PostgresDatabase(dsn.rsplit("/", 1)[0] + "/" + name, 1, 3)
+        admin = await asyncpg.connect(dsn)
+        db = None
         try:
+            await admin.execute(f'CREATE DATABASE "{name}"')
+            db = ServiceTestDatabase(dsn, name)
             await db.connect()
             yield db
         finally:
-            await db.close()
-            await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-            await admin.close()
+            cleanup = asyncio.create_task(cleanup_database(admin, db, name))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise
 
     return create
 

@@ -47,6 +47,5 @@ fi
 docker run --rm --name "$name-client" --network "$name" \
     --label "test-run=$name" --cpus 1 --memory 768m \
     --tmpfs /tmp:rw,size=128m \
-    -e TEST_DATABASE_DSN=postgresql://postgres@db/postgres \
     -v "$PWD:/src:ro" -w /src "$image" /app/.venv/bin/python -m pytest \
-    -p no:cacheprovider "$@"
+    -p no:cacheprovider --service-test-dsn=postgresql://postgres@db/postgres "$@"
