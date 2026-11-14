@@ -1,3 +1,5 @@
+import asyncio
+from dataclasses import dataclass
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +18,7 @@ from typing import (
 import asyncpg
 
 from .base import Database
+from .generations import backfill_legacy
 from .models import (
     Chain,
     ChainProduct,
@@ -42,6 +45,13 @@ def _unique_batch[T](rows: list[T], key: Callable[[T], tuple]) -> list[T]:
     return list(unique.values())
 
 
+@dataclass(frozen=True)
+class _TransactionContext:
+    owner: asyncio.Task | None
+    connection: asyncpg.Connection
+    mode: str
+
+
 class PostgresDatabase(Database):
     """PostgreSQL implementation of the database interface using asyncpg."""
 
@@ -57,7 +67,7 @@ class PostgresDatabase(Database):
         self.min_size = min_size
         self.max_size = max_size
         self.pool = None
-        self._import_conn: ContextVar[asyncpg.Connection | None] = ContextVar(
+        self._import_conn: ContextVar[_TransactionContext | None] = ContextVar(
             "import_connection", default=None
         )
         self.logger = logging.getLogger(__name__)
@@ -74,7 +84,11 @@ class PostgresDatabase(Database):
         """Context manager to acquire a connection from the pool."""
         active = self._import_conn.get()
         if active is not None:
-            yield active
+            if active.owner is not asyncio.current_task():
+                raise RuntimeError(
+                    "Transaction connection owner differs from current task"
+                )
+            yield active.connection
             return
         if not self.pool:
             raise RuntimeError("Database pool is not initialized")
@@ -89,17 +103,48 @@ class PostgresDatabase(Database):
                 yield conn
 
     @asynccontextmanager
-    async def import_transaction(self):
+    async def _writer_transaction(self, mode: str):
         if self._import_conn.get() is not None:
-            raise RuntimeError("Nested import is unsupported")
+            raise RuntimeError("Nested writer transaction is unsupported")
         async with self._get_conn() as conn:
-            async with conn.transaction():
+            async with conn.transaction(isolation="read_committed"):
                 await conn.execute("SELECT pg_advisory_xact_lock(73198421)")
-                token = self._import_conn.set(conn)
+                token = self._import_conn.set(
+                    _TransactionContext(asyncio.current_task(), conn, mode)
+                )
                 try:
-                    yield
+                    yield conn
                 finally:
                     self._import_conn.reset(token)
+
+    @asynccontextmanager
+    async def _cleanup_connection(self):
+        if self._import_conn.get() is not None:
+            raise RuntimeError("Nested writer transaction is unsupported")
+        async with self._get_conn() as conn:
+            token = None
+            try:
+                await conn.execute("SELECT pg_advisory_lock(73198421)")
+                token = self._import_conn.set(
+                    _TransactionContext(asyncio.current_task(), conn, "cleanup")
+                )
+                yield conn
+            finally:
+                if token is not None:
+                    self._import_conn.reset(token)
+                unlock = asyncio.create_task(
+                    conn.execute("SELECT pg_advisory_unlock(73198421)")
+                )
+                try:
+                    await asyncio.shield(unlock)
+                except asyncio.CancelledError:
+                    await unlock
+                    raise
+
+    @asynccontextmanager
+    async def import_transaction(self):
+        async with self._writer_transaction("import"):
+            yield
 
     async def close(self) -> None:
         """Close all database connections."""
@@ -115,11 +160,13 @@ class PostgresDatabase(Database):
 
             async with self._get_conn() as conn:
                 async with conn.transaction():
+                    await conn.execute("SELECT pg_advisory_xact_lock(73198421)")
                     await conn.execute(schema_sql)
                     for migration in sorted(
                         (Path(__file__).parent / "migrations").glob("*.sql")
                     ):
                         await conn.execute(migration.read_text())
+                    await backfill_legacy(conn)
                 self.logger.info("Database tables created successfully")
         except Exception as e:
             self.logger.error(f"Error creating tables: {e}")
@@ -959,7 +1006,23 @@ class PostgresDatabase(Database):
         """
         return condition, [price_date, chain_ids]
 
+    async def cleanup_is_protected(self) -> bool:
+        return bool(
+            await self._fetchval(
+                "SELECT EXISTS(SELECT 1 FROM generations WHERE accepted_at IS NOT NULL)"
+            )
+        )
+
     async def count_prices_before(self, before: date) -> dict[date, int]:
+        async with self._writer_transaction("cleanup"):
+            if await self.cleanup_is_protected():
+                self.logger.warning(
+                    "Accepted generations protect all legacy prices; cleanup disabled"
+                )
+                return {}
+            return await self._count_prices_before(before)
+
+    async def _count_prices_before(self, before: date) -> dict[date, int]:
         kept = await self._get_kept_chains(before)
         counts: dict[date, int] = {}
         async for price_date in self._price_dates_before(before):
@@ -974,6 +1037,15 @@ class PostgresDatabase(Database):
         return counts
 
     async def delete_prices_before(self, before: date) -> dict[date, int]:
+        async with self._cleanup_connection():
+            if await self.cleanup_is_protected():
+                raise RuntimeError("Accepted generations disable destructive cleanup")
+            deleted = await self._delete_prices_before(before)
+        if deleted:
+            await self._vacuum_prices(sum(deleted.values()))
+        return deleted
+
+    async def _delete_prices_before(self, before: date) -> dict[date, int]:
         kept = await self._get_kept_chains(before)
         deleted: dict[date, int] = {}
         async for price_date in self._price_dates_before(before):
@@ -992,8 +1064,6 @@ class PostgresDatabase(Database):
             else:
                 self.logger.debug(f"{price_date}: no rows to delete")
 
-        if deleted:
-            await self._vacuum_prices(sum(deleted.values()))
         return deleted
 
     async def _vacuum_prices(self, deleted: int) -> None:
