@@ -55,9 +55,9 @@ async def backfill_legacy(conn: asyncpg.Connection) -> int | None:
     await conn.execute(
         """INSERT INTO generation_stats
         SELECT $1, chain_product_id,
-               min(coalesce(special_price,regular_price)),
-               max(coalesce(special_price,regular_price)),
-               avg(coalesce(special_price,regular_price)),
+               min(least(regular_price,special_price)),
+               max(least(regular_price,special_price)),
+               avg(least(regular_price,special_price)),
                count(*),min(price_date),max(price_date)
         FROM offer_versions GROUP BY chain_product_id""",
         generation,

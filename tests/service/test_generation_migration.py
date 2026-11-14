@@ -239,3 +239,31 @@ def test_cleanup_cli_reports_protected_state(database, monkeypatch, caplog):
             assert await db._fetchval("SELECT count(*) FROM prices") == 2
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("special", [None, "0", "1.00", "3.00"])
+def test_baseline_uses_lower_supplied_price(database, special):
+    from decimal import Decimal
+
+    async def run():
+        async with database() as db:
+            await legacy(db)
+            async with db._get_conn() as conn:
+                await conn.execute(
+                    "UPDATE prices SET regular_price=2.01,special_price=$1 WHERE store_id=1",
+                    Decimal(special) if special is not None else None,
+                )
+            await db.create_tables()
+            first = (
+                min(Decimal("2.01"), Decimal(special))
+                if special is not None
+                else Decimal("2.01")
+            )
+            async with db._get_conn() as conn:
+                stats = await conn.fetchrow("SELECT * FROM generation_stats")
+                assert stats["min_price"] == first
+                assert stats["max_price"] == Decimal("3")
+                assert stats["avg_price"] == (first + Decimal("3")) / 2
+                assert stats["offer_count"] == 2
+
+    asyncio.run(run())
