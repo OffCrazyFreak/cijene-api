@@ -80,7 +80,10 @@ def test_request_keeps_snapshot_during_import(database, tmp_path):
                         return getattr(self.conn, name)
 
                     async def fetch(self, query, *args):
-                        if "SELECT DISTINCT name" in query:
+                        if (
+                            "SELECT id,name,brand,quantity,unit FROM chain_products"
+                            in query
+                        ):
                             pinned.set()
                             await asyncio.wait_for(published.wait(), 10)
                         return await self.conn.fetch(query, *args)
@@ -119,7 +122,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
     import tracemalloc
     from contextlib import asynccontextmanager
 
-    from service.db import search as matcher
+    from service.db import vocabulary as matcher
 
     async def run():
         async with database() as db:
@@ -202,7 +205,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                     async with original_connection() as conn:
                         yield ObservedConnection(conn)
 
-                offer_count = await db._fetchval("SELECT count(*) FROM prices")
+                offer_count = await db._fetchval("SELECT count(*) FROM latest_offers")
                 tracemalloc.start()
                 started = time.monotonic()
                 with (
@@ -213,7 +216,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                 elapsed = time.monotonic() - started
                 _, peak = tracemalloc.get_traced_memory()
                 tracemalloc.stop()
-                assert len(calls) == len(candidates)
+                assert len(calls) == 2
                 assert max(fetch_sizes) <= len(candidates)
                 assert data["products"][0]["ean"] == "1"
                 assert data["products"][0]["shop_count"] == 1

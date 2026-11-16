@@ -1,5 +1,6 @@
 """Complete latest-offer matching, scoped aggregation and stable pagination."""
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -10,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from common.barcodes import normalize_barcode
-from service.db.matching import normalize, relevance
+from service.db.matching import normalize
+from service.db.vocabulary import CatalogueRow, vocabulary_cache
 
 SQL = Path(__file__).with_name("latest.sql").read_text()
 MAX_QUERY_LENGTH = 256
@@ -124,6 +126,7 @@ async def search(
             if decoded and decoded["epoch"] != epoch:
                 raise CursorExpired
             return await serving_search(
+                database,
                 conn,
                 epoch,
                 scope,
@@ -187,7 +190,24 @@ async def latest_prices(
             return list(shops.values())
 
 
+async def matched_chain_products(
+    database: Any, conn: Any, epoch: int, q: str
+) -> tuple[list[int], list[int]] | None:
+    if not normalize(q):
+        return None
+
+    async def load() -> list[CatalogueRow]:
+        rows = await conn.fetch(
+            "SELECT id,name,brand,quantity,unit FROM chain_products"
+        )
+        return [tuple(row) for row in rows]
+
+    index = await vocabulary_cache(database).get(epoch, load)
+    return await asyncio.to_thread(index.match, q)
+
+
 async def serving_search(
+    database: Any,
     conn: Any,
     epoch: int,
     scope: str,
@@ -202,50 +222,33 @@ async def serving_search(
     identity: str | None,
     city_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    metadata = await conn.fetch(
-        "SELECT DISTINCT name,brand,quantity,unit FROM chain_products"
-    )
-    known_brands = {
-        token for row in metadata for token in normalize(row["brand"] or "").split()
-    }
-    scores = []
-    for row in metadata:
-        score = relevance(
-            q,
-            row["name"],
-            row["brand"] or "",
-            row["quantity"],
-            row["unit"],
-            known_brands,
+    identity_value = normalize_barcode(identity) or identity if identity else None
+    matched = await matched_chain_products(database, conn, epoch, q)
+    if matched is None:
+        candidates = (
+            "SELECT ean,0 rank FROM products WHERE ($1::text IS NULL OR ean=$1)"
         )
-        if score is not None:
-            scores.append(
-                [row["name"], row["brand"], row["quantity"], row["unit"], *score]
-            )
-    accepted = (
-        """WITH variants AS (
-        SELECT x->>0 name,x->>1 brand,x->>2 quantity,x->>3 unit,
-               (x->>4)::int intent,(x->>5)::int quality
-        FROM jsonb_array_elements($1::jsonb) x
-    ), candidates AS MATERIALIZED (
-        SELECT p.ean,min(v.intent*10+v.quality) rank
-        FROM chain_products cp
-        JOIN variants v ON cp.name=v.name AND cp.brand IS NOT DISTINCT FROM v.brand
-          AND cp.quantity IS NOT DISTINCT FROM v.quantity AND cp.unit IS NOT DISTINCT FROM v.unit
+        args: list[Any] = [identity_value]
+    else:
+        candidates = """
+        SELECT p.ean,min(m.rank) rank
+        FROM unnest($2::bigint[],$3::int[]) m(id,rank)
+        JOIN chain_products cp ON cp.id=m.id
         JOIN products p ON p.id=cp.product_id
-        WHERE ($2::text IS NULL OR p.ean=$2)
-        GROUP BY p.ean
-    ), raw AS MATERIALIZED ("""
+        WHERE ($1::text IS NULL OR p.ean=$1)
+        GROUP BY p.ean"""
+        args = [identity_value, *matched]
+    candidate_args = len(args)
+    accepted = (
+        "WITH candidates AS MATERIALIZED ("
+        + candidates
+        + "), raw AS MATERIALIZED ("
         + SQL
         + " AND p.ean IN (SELECT ean FROM candidates)"
         + """), matching AS (
         SELECT raw.*,((SELECT jsonb_object_agg(ean,rank) FROM candidates)->>raw.ean)::int rank FROM raw
     ) """
     )
-    args: list[Any] = [
-        json.dumps(scores, default=str),
-        normalize_barcode(identity) or identity if identity else None,
-    ]
     filters = dict(
         chain=selection(chains),
         city=literal_selection(city),
@@ -256,7 +259,8 @@ async def serving_search(
     for facet, wanted in filters.items():
         values = (
             await conn.fetch(
-                accepted + f"SELECT DISTINCT {facet} FROM matching", *args[:2]
+                accepted + f"SELECT DISTINCT {facet} FROM matching",
+                *args[:candidate_args],
             )
             if wanted
             else []
@@ -269,7 +273,10 @@ async def serving_search(
     accepted = accepted.replace(
         "FROM raw",
         "FROM raw WHERE "
-        + " AND ".join(f"${i}::text[] IS NOT NULL" for i in range(3, 7)),
+        + " AND ".join(
+            f"${i}::text[] IS NOT NULL"
+            for i in range(candidate_args + 1, candidate_args + 5)
+        ),
     )
     # Every facet excludes only its own selection from the same accepted relation.
     facets = {}

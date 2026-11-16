@@ -31,6 +31,14 @@ INTENT_MODIFIERS = {
     "aroma",
 }
 STRICT = {"bez", "bio", "vegan", "light", "zero", "integralno", "laktoze", "glutena"}
+PACK_UNITS = {
+    "ml": ("l", Decimal(".001")),
+    "l": ("l", Decimal(1)),
+    "g": ("kg", Decimal(".001")),
+    "kg": ("kg", Decimal(1)),
+}
+PREFIX_MIN_LENGTH = 3
+EDIT_MIN_LENGTH = 4
 
 
 def normalize(value: str) -> str:
@@ -83,6 +91,24 @@ def token_distance(left: str, right: str, max_distance: int | None = None) -> in
     return previous[-1]
 
 
+def edit_budget(token: str) -> int:
+    return 2 if len(token) >= 8 else 1
+
+
+def pack_pairs(tokens: list[str]) -> list[int]:
+    """Indexes of number and unit token pairs that must match a pack size."""
+    pairs = []
+    for index in range(len(tokens) - 1):
+        if tokens[index + 1] not in PACK_UNITS:
+            continue
+        try:
+            Decimal(tokens[index])
+        except ArithmeticError:
+            continue
+        pairs.append(index)
+    return pairs
+
+
 def relevance(
     query: str,
     name: str,
@@ -96,30 +122,19 @@ def relevance(
     requested_brands = (known_brands or set()) & set(tokens)
     if requested_brands and not requested_brands <= set(normalize(brand).split()):
         return None
-    conversions = {
-        "ml": ("l", Decimal(".001")),
-        "l": ("l", Decimal(1)),
-        "g": ("kg", Decimal(".001")),
-        "kg": ("kg", Decimal(1)),
-    }
-    for index in range(len(tokens) - 1):
-        if tokens[index + 1] not in conversions:
-            continue
-        try:
-            amount = Decimal(tokens[index])
-        except ArithmeticError:
-            continue
-        target_unit, factor = conversions[tokens[index + 1]]
+    for index in pack_pairs(tokens):
+        amount = Decimal(tokens[index])
+        target_unit, factor = PACK_UNITS[tokens[index + 1]]
         packs = []
         for i in range(len(words) - 1):
-            if words[i + 1] in conversions:
+            if words[i + 1] in PACK_UNITS:
                 try:
-                    pack_unit, pack_factor = conversions[words[i + 1]]
+                    pack_unit, pack_factor = PACK_UNITS[words[i + 1]]
                     packs.append((pack_unit, Decimal(words[i]) * pack_factor))
                 except ArithmeticError:
                     pass
-        if quantity is not None and unit in conversions:
-            actual_unit, actual_factor = conversions[unit]
+        if quantity is not None and unit in PACK_UNITS:
+            actual_unit, actual_factor = PACK_UNITS[unit]
             try:
                 packs = [(actual_unit, Decimal(quantity) * actual_factor)]
             except ArithmeticError:
@@ -136,14 +151,14 @@ def relevance(
             continue
         if token in STRICT or any(c.isdigit() for c in token):
             return None
-        if len(token) >= 3 and any(
+        budget = edit_budget(token)
+        if len(token) >= PREFIX_MIN_LENGTH and any(
             word.startswith(token) for word in substitution_words
         ):
             quality = max(quality, 1)
-        elif len(token) >= 4 and any(
-            abs(len(token) - len(word)) <= (2 if len(token) >= 8 else 1)
-            and token_distance(token, word, 2 if len(token) >= 8 else 1)
-            <= (2 if len(token) >= 8 else 1)
+        elif len(token) >= EDIT_MIN_LENGTH and any(
+            abs(len(token) - len(word)) <= budget
+            and token_distance(token, word, budget) <= budget
             for word in substitution_words
         ):
             quality = max(quality, 2)
