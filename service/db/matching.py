@@ -96,18 +96,45 @@ def edit_budget(token: str) -> int:
     return 2 if len(token) >= 8 else 1
 
 
+PackSize = tuple[str, Decimal]
+
+
+def pack_size(amount: str, unit: str) -> PackSize | None:
+    if unit not in PACK_UNITS:
+        return None
+    try:
+        value = Decimal(amount)
+    except ArithmeticError:
+        return None
+    if not value.is_finite():
+        return None
+    target_unit, factor = PACK_UNITS[unit]
+    return target_unit, value * factor
+
+
 def pack_pairs(tokens: list[str]) -> list[int]:
     """Indexes of number and unit token pairs that must match a pack size."""
-    pairs = []
-    for index in range(len(tokens) - 1):
-        if tokens[index + 1] not in PACK_UNITS:
-            continue
-        try:
-            Decimal(tokens[index])
-        except ArithmeticError:
-            continue
-        pairs.append(index)
-    return pairs
+    return [
+        index
+        for index in range(len(tokens) - 1)
+        if pack_size(tokens[index], tokens[index + 1]) is not None
+    ]
+
+
+def pack_sizes(
+    words: Sequence[str], quantity: str | None, unit: str | None
+) -> list[PackSize]:
+    """Pack sizes written in the name plus the structured quantity, if any."""
+    sizes = [
+        size
+        for i in range(len(words) - 1)
+        if (size := pack_size(words[i], words[i + 1])) is not None
+    ]
+    if quantity is not None and unit is not None:
+        structured = pack_size(quantity, unit)
+        if structured is not None:
+            sizes.append(structured)
+    return sizes
 
 
 def relevance(
@@ -141,24 +168,10 @@ def score_words(
     requested_brands = (known_brands or set()) & set(tokens)
     if requested_brands and not requested_brands <= set(brand_words):
         return None
-    for index in pack_pairs(tokens):
-        amount = Decimal(tokens[index])
-        target_unit, factor = PACK_UNITS[tokens[index + 1]]
-        packs = []
-        for i in range(len(words) - 1):
-            if words[i + 1] in PACK_UNITS:
-                try:
-                    pack_unit, pack_factor = PACK_UNITS[words[i + 1]]
-                    packs.append((pack_unit, Decimal(words[i]) * pack_factor))
-                except ArithmeticError:
-                    pass
-        if quantity is not None and unit in PACK_UNITS:
-            actual_unit, actual_factor = PACK_UNITS[unit]
-            try:
-                packs = [(actual_unit, Decimal(quantity) * actual_factor)]
-            except ArithmeticError:
-                return None
-        if (target_unit, amount * factor) not in packs:
+    pairs = pack_pairs(tokens)
+    packs = pack_sizes(words, quantity, unit) if pairs else []
+    for index in pairs:
+        if pack_size(tokens[index], tokens[index + 1]) not in packs:
             return None
         words.extend(tokens[index : index + 2])
     substitution_words = [word for word in words if word not in brand_words]

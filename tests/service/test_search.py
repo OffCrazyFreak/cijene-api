@@ -16,6 +16,11 @@ def test_matching():
     assert ingredient < flavored
     assert relevance("limun pivo", "Pivo limun", "") is not None
     assert relevance("bez laktoze", "Mlijeko laktoza", "") is None
+    assert relevance("mlijeko 1 l", "Mlijeko 6 x 1 l", "", "6", "l") is not None
+    assert relevance("mlijeko 6 l", "Mlijeko 6 x 1 l", "", "6", "l") is not None
+    assert relevance("mlijeko 2 l", "Mlijeko 6 x 1 l", "", "6", "l") is None
+    assert relevance("mlijeko 1 l", "Mlijeko", "", "abc", "l") is None
+    assert relevance("snan l", "Snan l", "") is not None
 
 
 def test_authored_query_retrieval_report():
