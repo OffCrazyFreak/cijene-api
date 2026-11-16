@@ -218,21 +218,9 @@ def prepare_input(path: Path, destination: Path) -> None:
                             for field, limit in limits.items()
                         ):
                             raise ValueError("Missing identity or oversized metadata")
+                        # Two product codes of one barcode in a shop are kept; reads pick one.
                         if not remember(index, kind, key, row):
                             continue
-                        if kind == "prices":
-                            product = json.loads(
-                                index.execute(
-                                    "SELECT payload FROM entries WHERE kind='products' AND key=?",
-                                    (row["product_id"],),
-                                ).fetchone()[0]
-                            )
-                            alias_key = json.dumps(
-                                [barcode(product, chain.name), row["store_id"]]
-                            )
-                            offer = dict(row)
-                            del offer["product_id"]
-                            remember(index, "alias", alias_key, offer)
                         writer.writerow(row)
                     if writer is None:
                         with source.open(encoding="utf-8", newline="") as original:

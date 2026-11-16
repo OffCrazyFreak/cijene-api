@@ -123,7 +123,7 @@ def test_validation_closes_sqlite_connection(tmp_path, invalid):
         check = connect(destination / "validation.sqlite")
         try:
             count = check.execute("SELECT count(*) FROM entries").fetchone()[0]
-            assert count == (0 if invalid else 4)
+            assert count == (0 if invalid else 3)
         finally:
             check.close()
     finally:

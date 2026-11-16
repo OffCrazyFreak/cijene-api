@@ -120,6 +120,40 @@ def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path, caplog):
     asyncio.run(run())
 
 
+def test_importer_keeps_two_codes_of_one_barcode(database, tmp_path, caplog):
+    from decimal import Decimal
+
+    from tests.service.import_fixtures import rewrite
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            day = write_day(tmp_path, "14.10", "Vino cuvee")
+            rewrite(
+                day / "test" / "products.csv",
+                lambda rows: rows.append(
+                    dict(rows[0], product_id="002", barcode="12345678")
+                ),
+            )
+            rewrite(
+                day / "test" / "prices.csv",
+                lambda rows: rows.append(
+                    dict(rows[0], product_id="002", price="14.05")
+                ),
+            )
+            with patch.object(importer, "db", db):
+                await importer.import_directory(day, False)
+
+            assert await db._fetchval("SELECT count(*) FROM latest_offers") == 2
+            assert "1 shops list one barcode under several chain codes" in caplog.text
+            product = (await search(db, q="vino"))["products"][0]
+            assert product["shop_count"] == 1
+            assert product["min_price"] == Decimal("14.10")
+
+    asyncio.run(run())
+
+
 def test_metadata_source_date_without_new_offer(database, tmp_path):
     import shutil
     from tests.service.import_fixtures import rewrite

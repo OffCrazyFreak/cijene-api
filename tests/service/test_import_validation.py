@@ -81,14 +81,15 @@ def test_duplicate_permutations(database, tmp_path, conflict, reverse, alias):
                     rows.reverse()
 
             rewrite(day / "test" / "prices.csv", duplicate)
+            rejected = conflict and not alias
             with patch.object(importer, "db", db):
-                if conflict:
+                if rejected:
                     with pytest.raises(ValueError):
                         await importer.import_directory(day, False)
                 else:
                     await importer.import_directory(day, False)
             assert await db._fetchval("SELECT count(*) FROM prices") == (
-                0 if conflict else 2 if alias else 1
+                0 if rejected else 2 if alias else 1
             )
 
     asyncio.run(run())
