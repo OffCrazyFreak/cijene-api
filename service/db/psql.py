@@ -63,6 +63,15 @@ async def _backfill_latest_offers(conn: asyncpg.Connection) -> None:
         ON CONFLICT DO NOTHING
         """
     )
+    await conn.execute(
+        """
+        INSERT INTO chain_import_dates
+        SELECT chain_id, max(price_date) FROM prices
+        JOIN chain_products cp ON cp.id = prices.chain_product_id
+        GROUP BY chain_id
+        ON CONFLICT DO NOTHING
+        """
+    )
     await conn.execute("UPDATE import_state SET baseline_complete = TRUE")
 
 
@@ -894,6 +903,16 @@ class PostgresDatabase(Database):
                     special_sale_type = EXCLUDED.special_sale_type
                 WHERE EXCLUDED.price_date >= latest_offers.price_date
                     AND ROW(latest_offers.*) IS DISTINCT FROM ROW(EXCLUDED.*)
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO chain_import_dates
+                SELECT cp.chain_id, max(t.price_date) FROM temp_prices t
+                JOIN chain_products cp ON cp.id = t.chain_product_id
+                GROUP BY cp.chain_id
+                ON CONFLICT (chain_id) DO UPDATE SET price_date = EXCLUDED.price_date
+                WHERE EXCLUDED.price_date > chain_import_dates.price_date
                 """
             )
             duplicates = {

@@ -71,6 +71,7 @@ class Ordering:
     keys: list[SortKey]
     facets: dict[str, dict[str, int]]
     outside: int
+    partial: bool
 
 
 @dataclass

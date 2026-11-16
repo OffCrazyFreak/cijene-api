@@ -114,6 +114,8 @@ def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path):
             ean = await db._fetchval("SELECT ean FROM products")
             prices = await latest_prices(db, {ean}, lambda stores: stores)
             assert [row["regular_price"] for row in prices] == [Decimal("1.00")]
+            older_alias = await search(db, q="original", category=["Food"])
+            assert older_alias["total"] == 0
 
     asyncio.run(run())
 
@@ -279,5 +281,45 @@ def test_one_batch_with_two_dates_keeps_the_newest_latest_offer(database):
                 "SELECT price_date::text || ' ' || regular_price FROM latest_offers"
             )
             assert latest == "2026-11-14 2.00"
+
+    asyncio.run(run())
+
+
+def test_partial_marks_carried_forward_offers(database, tmp_path):
+    import shutil
+
+    from tests.service.import_fixtures import rewrite
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            first = write_day(tmp_path, "2.00", "Mlijeko").rename(
+                tmp_path / "2026-11-13"
+            )
+            rewrite(
+                first / "test" / "stores.csv",
+                lambda rows: rows.append({"store_id": "02", "city": "Other"}),
+            )
+            rewrite(
+                first / "test" / "prices.csv",
+                lambda rows: rows.append(dict(rows[0], store_id="02")),
+            )
+            with patch.object(importer, "db", db):
+                await importer.import_directory(first, False)
+                complete = await search(db, q="mlijeko")
+                assert complete["partial"] is False
+                assert complete["products"][0]["partial"] is False
+
+                second = tmp_path / "2026-11-14"
+                shutil.copytree(first, second)
+                rewrite(second / "test" / "prices.csv", lambda rows: rows.pop())
+                await importer.import_directory(second, False)
+
+            carried = await search(db, q="mlijeko")
+            product = carried["products"][0]
+            assert carried["partial"] is True and product["partial"] is True
+            assert [chain["partial"] for chain in product["chains"]] == [True]
+            assert (await search(db, q="mlijeko", city=["City"]))["partial"] is False
 
     asyncio.run(run())

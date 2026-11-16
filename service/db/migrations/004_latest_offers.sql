@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS latest_offers (
 
 CREATE INDEX IF NOT EXISTS idx_latest_offers_store_id ON latest_offers (store_id);
 
+-- An offer older than its chain's newest imported date is a carried-forward observation.
+CREATE TABLE IF NOT EXISTS chain_import_dates (
+    chain_id INTEGER PRIMARY KEY REFERENCES chains (id),
+    price_date DATE NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS import_state (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     epoch BIGINT NOT NULL DEFAULT 0,
@@ -81,7 +87,7 @@ DO $triggers$
 DECLARE
     served TEXT;
 BEGIN
-    FOREACH served IN ARRAY ARRAY['chains', 'stores', 'products', 'chain_products', 'latest_offers'] LOOP
+    FOREACH served IN ARRAY ARRAY['chains', 'stores', 'products', 'chain_products', 'latest_offers', 'chain_import_dates'] LOOP
         EXECUTE format(
             'CREATE OR REPLACE TRIGGER epoch_after_insert AFTER INSERT ON %I '
             'REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION bump_import_epoch()',

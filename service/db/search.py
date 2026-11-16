@@ -243,7 +243,7 @@ async def search_snapshot(database: Any, request: ScopeRequest) -> dict[str, Any
         facets=ordering.facets,
         outside_location_total=ordering.outside,
         complete=True,
-        partial=True,
+        partial=ordering.partial,
     )
 
 
@@ -285,7 +285,7 @@ async def scope_ordering(
         keys.append((rank // 10, rank % 10, price, -shops, -chains, ean))
 
     facets = {facet: json.loads(row[facet]) for facet in filters}
-    return Ordering(keys, facets, row["outside"])
+    return Ordering(keys, facets, row["outside"], row["partial"])
 
 
 def pop_unit_prices(row: dict[str, Any]) -> dict[str, Any]:
@@ -305,7 +305,7 @@ async def page_products(
     for record in await conn.fetch(sql, *statement.args):
         row = dict(record)
         row["unit_prices"] = pop_unit_prices(row)
-        row.update(partial=True, listing_status="unknown")
+        row["listing_status"] = "unknown"
         if row["chain"] is None:
             products[row["ean"]] = product_summary(row)
         else:
