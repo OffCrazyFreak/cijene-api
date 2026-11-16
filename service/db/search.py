@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Iterable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,12 @@ class CursorExpired(Exception):
 
 
 def selection(value: str | None) -> set[str]:
-    return {normalize(v) for v in (value or "").split(",") if normalize(v)}
+    return literal_selection((value or "").split(","))
+
+
+def literal_selection(values: Iterable[str] | None) -> set[str]:
+    """Repeated filter values stay whole, because category and brand names contain commas."""
+    return {normalize(v) for v in values or [] if normalize(v)}
 
 
 def decode_cursor(value: str) -> dict[str, Any]:
@@ -67,9 +73,9 @@ async def search(
     *,
     q: str = "",
     chains: str | None = None,
-    city: str | None = None,
-    brand: str | None = None,
-    category: str | None = None,
+    city: list[str] | None = None,
+    brand: list[str] | None = None,
+    category: list[str] | None = None,
     order: str = "relevance",
     page_size: int = 100,
     cursor: str | None = None,
@@ -101,9 +107,9 @@ async def search(
     scope_data = [
         normalize(q),
         sorted(selection(chains)),
-        sorted(selection(city)),
-        sorted(selection(brand)),
-        sorted(selection(category)),
+        sorted(literal_selection(city)),
+        sorted(literal_selection(brand)),
+        sorted(literal_selection(category)),
         order,
         identity,
         sorted((city_labels or {}).items()),
@@ -188,9 +194,9 @@ async def serving_search(
     decoded: dict[str, Any] | None,
     q: str,
     chains: str | None,
-    city: str | None,
-    brand: str | None,
-    category: str | None,
+    city: list[str] | None,
+    brand: list[str] | None,
+    category: list[str] | None,
     order: str,
     page_size: int,
     identity: str | None,
@@ -242,9 +248,9 @@ async def serving_search(
     ]
     filters = dict(
         chain=selection(chains),
-        city=selection(city),
-        brand=selection(brand),
-        category=selection(category),
+        city=literal_selection(city),
+        brand=literal_selection(brand),
+        category=literal_selection(category),
     )
     clauses = {}
     for facet, wanted in filters.items():

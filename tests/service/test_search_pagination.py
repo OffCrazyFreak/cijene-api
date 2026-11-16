@@ -16,12 +16,12 @@ def test_real_import_scoped_average_and_pinned_pages(database, tmp_path):
                 await importer.import_directory(
                     write_day(tmp_path, "1.20", "Mlijeko"), False
                 )
-            first = await search(db, q="mlijeko", city="City")
+            first = await search(db, q="mlijeko", city=["City"])
             assert first["products"][0]["avg_price"] == Decimal("1.20")
             assert first["products"][0]["shop_count"] == 1
             assert first["total"] == 1
             assert first["facets"]["city"] == {"City": 1}
-            assert (await search(db, q="mlijeko", city="Elsewhere"))["total"] == 0
+            assert (await search(db, q="mlijeko", city=["Elsewhere"]))["total"] == 0
             assert (
                 first["products"][0]["chains"][0]["price_date"].isoformat()
                 == "2026-11-14"
@@ -71,7 +71,9 @@ def test_complete_relation_paging_and_expired_cursor(database, page_size):
                 cursor = page["next_cursor"]
             assert len(ids) == len(set(ids)) == 10001
             with pytest.raises(ValueError, match="scope"):
-                await search(db, q="mlijeko", city="Other", cursor=first["next_cursor"])
+                await search(
+                    db, q="mlijeko", city=["Other"], cursor=first["next_cursor"]
+                )
 
             async with db.import_transaction():
                 await db._fetchval(
@@ -136,7 +138,7 @@ def test_authored_queries_through_postgres_retrieval(database):
             for case in cases:
                 if case["q"].isdigit():
                     continue
-                result = await search(db, q=case["q"], category=str(case["id"]))
+                result = await search(db, q=case["q"], category=[str(case["id"])])
                 retrieved = {p["ean"].split(":")[-1] for p in result["products"]}
                 assert set(case["acceptable"]) <= retrieved, case["id"]
                 if case["acceptable"]:

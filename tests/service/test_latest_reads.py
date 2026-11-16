@@ -253,7 +253,7 @@ def test_city_alias_facets_keep_labels_and_unique_products(database, service_cli
                     "/v1/products/",
                     params={
                         "q": "Corrected",
-                        "city": "6C KRK,KRK",
+                        "city": ["6C KRK", "KRK"],
                         "city_labels": labels,
                     },
                     headers={"Authorization": "Bearer alias-fixture"},
@@ -270,5 +270,47 @@ def test_city_alias_facets_keep_labels_and_unique_products(database, service_cli
                         headers={"Authorization": "Bearer alias-fixture"},
                     )
                     assert invalid_response.status_code == 400
+
+    asyncio.run(run())
+
+
+def test_repeated_literal_filters_keep_commas(database, service_client):
+    async def run():
+        async with database() as db:
+            async with service_client(db) as client:
+                await db._fetchval(
+                    "INSERT INTO users(name,api_key) VALUES('filters','filters-fixture') RETURNING id"
+                )
+                async with db.import_transaction():
+                    async with db._get_conn() as conn:
+                        await conn.execute("""
+                            INSERT INTO chains(code) VALUES('one'),('two');
+                            INSERT INTO stores(chain_id,code,city) VALUES(1,'1','Split'),(2,'1','Zadar');
+                            INSERT INTO products(ean) VALUES('1'),('2'),('3');
+                            INSERT INTO chain_products(chain_id,product_id,code,name,category) VALUES
+                                (1,1,'1','Jabuka','Voće, povrće'),
+                                (1,2,'2','Jabuka sok','Voće'),
+                                (2,3,'3','Jabuka zelena','Povrće');
+                            INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price)
+                            VALUES(1,1,'2026-11-14',1),(2,1,'2026-11-14',1),(3,2,'2026-11-14',1);
+                        """)
+
+                async def eans(params):
+                    response = await client.get(
+                        "/v1/products/",
+                        params={"q": "jabuka", **params},
+                        headers={"Authorization": "Bearer filters-fixture"},
+                    )
+                    assert response.status_code == 200, response.text
+                    return sorted(p["ean"] for p in response.json()["products"])
+
+                assert await eans({"category": "Voće, povrće"}) == ["1"]
+                assert await eans({"category": ["Voće, povrće", "Povrće"]}) == [
+                    "1",
+                    "3",
+                ]
+                assert await eans({"city": ["Split", "Zadar"]}) == ["1", "2", "3"]
+                assert await eans({"chains": "one,two"}) == ["1", "2", "3"]
+                assert await eans({"chains": "two"}) == ["3"]
 
     asyncio.run(run())

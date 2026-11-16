@@ -91,13 +91,13 @@ def test_scoped_summary_and_filters(database):
                     ("1", 2, Decimal("1.40"), None),
                 ],
             )
-            result = await search(db, q="mlijeko", city="City", order="price_asc")
+            result = await search(db, q="mlijeko", city=["City"], order="price_asc")
             product = result["products"][0]
             assert product["shop_count"] == 2 and product["chain_count"] == 1
             assert product["min_price"] == Decimal("1.00")
             assert product["avg_price"] == Decimal("1.20")
             assert product["unit_prices"] == {"mass": Decimal("1.20")}
-            filtered = await search(db, q="mlijeko", city="City", brand="Other")
+            filtered = await search(db, q="mlijeko", city=["City"], brand=["Other"])
             assert filtered["total"] == 0
 
     asyncio.run(run())

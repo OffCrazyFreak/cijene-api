@@ -250,9 +250,9 @@ async def get_product(
         None,
         description="Comma-separated list of chain codes to include",
     ),
-    city: str | None = Query(None),
-    brand: str | None = Query(None),
-    category: str | None = Query(None),
+    city: list[str] | None = Query(None),
+    brand: list[str] | None = Query(None),
+    category: list[str] | None = Query(None),
 ) -> dict:
     """
     Get product information including chain products and prices by their
@@ -386,10 +386,10 @@ async def search_products(
     q: str = Query("", max_length=MAX_QUERY_LENGTH),
     date: datetime.date | None = Query(None),
     chains: str | None = Query(None),
-    city: str | None = Query(None),
+    city: list[str] | None = Query(None),
     city_labels: str | None = Query(None, max_length=16384),
-    brand: str | None = Query(None),
-    category: str | None = Query(None),
+    brand: list[str] | None = Query(None),
+    category: list[str] | None = Query(None),
     order: str = Query("relevance"),
     fuzzy: bool = Query(False, deprecated=True),
     page_size: int | None = Query(None, ge=1, le=10000),
