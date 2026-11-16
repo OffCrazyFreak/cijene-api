@@ -262,6 +262,20 @@ def test_city_alias_facets_keep_labels_and_unique_products(database, service_cli
                 assert data["facets"]["city"] == {"Krk": 1}
                 assert data["total"] == 1
                 assert data["products"][0]["shop_count"] == 2
+                ean = await db._fetchval("SELECT ean FROM products")
+                barcode = await client.get(
+                    f"/v1/products/{ean}/",
+                    params={"city": ["6C KRK", "KRK"], "city_labels": labels},
+                    headers={"Authorization": "Bearer alias-fixture"},
+                )
+                assert barcode.status_code == 200, barcode.text
+                assert barcode.json()["shop_count"] == 2
+                invalid_barcode = await client.get(
+                    f"/v1/products/{ean}/",
+                    params={"city_labels": "[]"},
+                    headers={"Authorization": "Bearer alias-fixture"},
+                )
+                assert invalid_barcode.status_code == 400
                 for invalid in ["not-json", "[]", '{"KRK": 4}']:
                     invalid_response = await client.get(
                         "/v1/products/",

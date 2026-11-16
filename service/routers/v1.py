@@ -236,6 +236,10 @@ class ProductSearchResponse(BaseModel):
     )
 
 
+def parse_city_labels(value: str | None) -> dict[str, str] | None:
+    return json.loads(value) if value is not None else None
+
+
 @router.get(
     "/products/{ean}/",
     summary="Get product data/prices by barcode",
@@ -252,6 +256,7 @@ async def get_product(
         description="Comma-separated list of chain codes to include",
     ),
     city: list[str] | None = Query(None),
+    city_labels: str | None = Query(None, max_length=16384),
     brand: list[str] | None = Query(None),
     category: list[str] | None = Query(None),
 ) -> dict:
@@ -270,7 +275,13 @@ async def get_product(
         raise HTTPException(400, "Historical dates are unsupported on latest routes")
     try:
         result = await search(
-            db, identity=ean, chains=chains, city=city, brand=brand, category=category
+            db,
+            identity=ean,
+            chains=chains,
+            city=city,
+            city_labels=parse_city_labels(city_labels),
+            brand=brand,
+            category=category,
         )
     except SearchTimeout as exc:
         raise HTTPException(503, "search_timeout") from exc
@@ -411,7 +422,7 @@ async def search_products(
             q=q,
             chains=chains,
             city=city,
-            city_labels=json.loads(city_labels) if city_labels is not None else None,
+            city_labels=parse_city_labels(city_labels),
             brand=brand,
             category=category,
             order=order,
