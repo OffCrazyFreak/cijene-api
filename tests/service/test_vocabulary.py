@@ -154,3 +154,14 @@ def test_candidates_shrink_the_scored_set():
     assert len(list(index.candidates("mlijeko"))) < len(index.variants) / 4
     assert len(list(index.candidates("1 l"))) < len(index.variants) / 2
     assert len(list(index.candidates("500 g"))) < len(index.variants) / 2
+
+
+def test_matching_stops_after_its_deadline():
+    import time
+
+    import pytest
+
+    index = VocabularyIndex(fixture_catalogue())
+    with pytest.raises(TimeoutError):
+        index.match("mljeko", time.monotonic() - 1)
+    assert index.match("mljeko", time.monotonic() + 60) == index.match("mljeko")

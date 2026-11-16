@@ -8,6 +8,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from collections.abc import Iterable
 from decimal import Decimal
+from time import monotonic
 from typing import Any
 
 from asyncpg.exceptions import QueryCanceledError
@@ -187,6 +188,7 @@ async def search(
         scope=scope,
         cursor_epoch=decoded["epoch"] if decoded else None,
         boundary=cursor_boundary(decoded["key"]) if decoded else None,
+        deadline=monotonic() + SEARCH_BUDGET_SECONDS,
     )
     try:
         async with asyncio.timeout(SEARCH_BUDGET_SECONDS):
@@ -206,6 +208,7 @@ class ScopeRequest:
     scope: str
     cursor_epoch: int | None
     boundary: SortKey | None
+    deadline: float
 
 
 async def search_snapshot(database: Any, request: ScopeRequest) -> dict[str, Any]:
@@ -297,7 +300,7 @@ async def scope_ordering(
     request: ScopeRequest,
 ) -> Ordering:
     matched = (
-        await asyncio.to_thread(catalogue.vocabulary.match, request.q)
+        await asyncio.to_thread(catalogue.vocabulary.match, request.q, request.deadline)
         if catalogue and normalize(request.q)
         else None
     )

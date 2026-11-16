@@ -4,7 +4,9 @@ from array import array
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
+from itertools import islice
 from sys import intern
+from time import monotonic
 
 from service.db.matching import (
     EDIT_MIN_LENGTH,
@@ -29,6 +31,19 @@ def letter_mask(word: str) -> int:
     for character in word:
         mask |= 1 << (ord(character) & 63)
     return mask
+
+
+class Deadline:
+    """Lets matching in a worker thread stop once the request budget has passed."""
+
+    def __init__(self, at: float | None):
+        self.at = at
+        self.steps = 0
+
+    def check(self) -> None:
+        self.steps += 1
+        if self.at is not None and self.steps % 256 == 1 and monotonic() > self.at:
+            raise TimeoutError("Matching passed the search time budget")
 
 
 class VocabularyIndex:
@@ -74,7 +89,7 @@ class VocabularyIndex:
         self.known_brands.update(brand_words)
         return variant_id
 
-    def _words_for(self, token: str) -> Iterable[str]:
+    def _words_for(self, token: str, deadline: Deadline) -> Iterable[str]:
         if token in self.postings:
             yield token
         if token in STRICT or any(c.isdigit() for c in token):
@@ -82,7 +97,7 @@ class VocabularyIndex:
 
         if len(token) >= PREFIX_MIN_LENGTH:
             start = bisect_left(self.sorted_words, token)
-            for word in self.sorted_words[start:]:
+            for word in islice(self.sorted_words, start, None):
                 if not word.startswith(token):
                     break
                 yield word
@@ -92,15 +107,17 @@ class VocabularyIndex:
             mask = letter_mask(token)
             for length in range(len(token) - budget, len(token) + budget + 1):
                 for word, word_mask in self.words_by_length.get(length, ()):
+                    deadline.check()
                     # One edit changes at most two letters of the letter set.
                     if (mask ^ word_mask).bit_count() > 2 * budget:
                         continue
                     if token_distance(token, word, budget) <= budget:
                         yield word
 
-    def _variants_for(self, token: str) -> set[int]:
+    def _variants_for(self, token: str, deadline: Deadline) -> set[int]:
         found: set[int] = set()
-        for word in self._words_for(token):
+        for word in self._words_for(token, deadline):
+            deadline.check()
             found.update(self.postings[word])
         return found
 
@@ -108,8 +125,9 @@ class VocabularyIndex:
         size = pack_size(amount, unit)
         return set(self.pack_postings.get(size, ())) if size else set()
 
-    def candidates(self, query: str) -> Iterable[int]:
+    def candidates(self, query: str, deadline: Deadline | None = None) -> Iterable[int]:
         """Every variant that relevance() could accept, possibly with extras."""
+        deadline = deadline or Deadline(None)
         tokens = normalize(query).split()
         pairs = pack_pairs(tokens)
         satisfied_by_packs = {tokens[i + offset] for i in pairs for offset in (0, 1)}
@@ -117,7 +135,7 @@ class VocabularyIndex:
         if not constrained and not pairs:
             return range(len(self.variants))
 
-        word_matches = (self._variants_for(token) for token in constrained)
+        word_matches = (self._variants_for(token, deadline) for token in constrained)
         pack_matches = (
             self._variants_with_pack(tokens[i], tokens[i + 1]) for i in pairs
         )
@@ -127,12 +145,16 @@ class VocabularyIndex:
             result &= other
         return result
 
-    def match(self, query: str) -> tuple[list[int], list[int]]:
+    def match(
+        self, query: str, deadline_at: float | None = None
+    ) -> tuple[list[int], list[int]]:
         """Chain product ids and their rank for every variant relevance() accepts."""
+        deadline = Deadline(deadline_at)
         tokens = normalize(query).split()
         ids: list[int] = []
         ranks: list[int] = []
-        for variant_id in self.candidates(query):
+        for variant_id in self.candidates(query, deadline):
+            deadline.check()
             _, _, quantity, unit = self.variants[variant_id]
             words, brand_words = self.variant_words[variant_id]
             score = score_words(
