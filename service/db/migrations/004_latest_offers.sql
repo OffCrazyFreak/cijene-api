@@ -56,6 +56,8 @@ BEGIN
         changed := EXISTS (SELECT 1 FROM new_rows);
     ELSIF TG_OP = 'DELETE' THEN
         changed := EXISTS (SELECT 1 FROM old_rows);
+    ELSIF TG_OP = 'TRUNCATE' THEN
+        changed := TRUE;
     ELSE
         -- Provenance dates are not served, so stamping them must not expire cursors.
         changed := EXISTS (
@@ -93,6 +95,11 @@ BEGIN
         EXECUTE format(
             'CREATE OR REPLACE TRIGGER epoch_after_delete AFTER DELETE ON %I '
             'REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION bump_import_epoch()',
+            served
+        );
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER epoch_after_truncate AFTER TRUNCATE ON %I '
+            'FOR EACH STATEMENT EXECUTE FUNCTION bump_import_epoch()',
             served
         );
     END LOOP;

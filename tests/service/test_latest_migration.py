@@ -217,4 +217,7 @@ def test_epoch_moves_once_per_changing_transaction(database):
                 await conn.execute("UPDATE latest_offers SET regular_price=7")
                 assert await epoch() == 3
 
+                await conn.execute("TRUNCATE latest_offers")
+                assert await epoch() == 4
+
     asyncio.run(run())
