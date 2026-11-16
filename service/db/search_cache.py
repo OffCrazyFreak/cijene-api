@@ -66,6 +66,10 @@ async def fetch_catalogue(conn: Any) -> tuple[list[Any], list[str], list[str]]:
     return chain_products, chains, cities
 
 
+class CatalogueBuildAbandoned(Exception):
+    """The request that started a build stopped before handing it off; retry."""
+
+
 @dataclass(frozen=True)
 class Ordering:
     keys: list[SortKey]
@@ -77,35 +81,71 @@ class Ordering:
 @dataclass
 class SearchCache:
     catalogues: dict[int, Catalogue] = field(default_factory=dict)
-    pending: dict[int, asyncio.Task[Catalogue]] = field(default_factory=dict)
+    pending: dict[int, asyncio.Future[Catalogue]] = field(default_factory=dict)
     orderings: OrderedDict[tuple[int, str], Ordering] = field(
         default_factory=OrderedDict
     )
 
     async def catalogue(self, epoch: int, conn: Any) -> Catalogue:
-        if epoch in self.catalogues:
-            return self.catalogues[epoch]
+        loop = asyncio.get_running_loop()
+        while epoch not in self.catalogues:
+            pending = self.pending.get(epoch)
+            if pending is not None and pending.get_loop() is loop:
+                try:
+                    # A cancelled request must not discard a build the next request reuses.
+                    return await asyncio.shield(pending)
+                except CatalogueBuildAbandoned:
+                    continue
 
-        build = self.pending.get(epoch)
-        if build is None or build.get_loop() is not asyncio.get_running_loop():
+            return await self._build(epoch, conn, loop)
+        return self.catalogues[epoch]
+
+    async def _build(
+        self, epoch: int, conn: Any, loop: asyncio.AbstractEventLoop
+    ) -> Catalogue:
+        # Reserved before the first await so concurrent cold requests share this build.
+        pending: asyncio.Future[Catalogue] = loop.create_future()
+        self.pending[epoch] = pending
+        try:
             chain_products, chains, cities = await fetch_catalogue(conn)
-            build = asyncio.create_task(
-                asyncio.to_thread(Catalogue.build, chain_products, chains, cities)
-            )
-            self.pending[epoch] = build
-            build.add_done_callback(lambda task: self._store(epoch, task))
+        except BaseException:
+            self._settle(epoch, pending, error=CatalogueBuildAbandoned())
+            raise
 
-        # A cancelled request must not discard a build the next request reuses.
-        return await asyncio.shield(build)
+        build = asyncio.create_task(
+            asyncio.to_thread(Catalogue.build, chain_products, chains, cities)
+        )
+        build.add_done_callback(lambda task: self._finish(epoch, pending, task))
+        return await asyncio.shield(pending)
 
-    def _store(self, epoch: int, build: asyncio.Task[Catalogue]) -> None:
-        if self.pending.get(epoch) is build:
+    def _finish(
+        self, epoch: int, pending: asyncio.Future[Catalogue], build: asyncio.Task
+    ) -> None:
+        if build.cancelled():
+            self._settle(epoch, pending, error=CatalogueBuildAbandoned())
+        elif build.exception() is not None:
+            self._settle(epoch, pending, error=build.exception())
+        else:
+            self.catalogues[epoch] = build.result()
+            while len(self.catalogues) > CATALOGUE_EPOCHS:
+                del self.catalogues[min(self.catalogues)]
+            self._settle(epoch, pending, result=build.result())
+
+    def _settle(
+        self,
+        epoch: int,
+        pending: asyncio.Future[Catalogue],
+        result: Catalogue | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.pending.get(epoch) is pending:
             del self.pending[epoch]
-        if build.cancelled() or build.exception() is not None:
+        if error is None and result is not None:
+            pending.set_result(result)
             return
-        self.catalogues[epoch] = build.result()
-        while len(self.catalogues) > CATALOGUE_EPOCHS:
-            del self.catalogues[min(self.catalogues)]
+        pending.set_exception(error or CatalogueBuildAbandoned())
+        # Waiters may all be gone; marking the error retrieved avoids a spurious log.
+        pending.exception()
 
     def ordering(self, epoch: int, scope: str) -> Ordering | None:
         ordering = self.orderings.get((epoch, scope))

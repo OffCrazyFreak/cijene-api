@@ -320,3 +320,43 @@ def test_time_budget_and_statement_timeout_return_503(
                 assert response.status_code == 200
 
     asyncio.run(run())
+
+
+def test_cold_requests_share_one_catalogue_build(database, monkeypatch):
+    import asyncio
+    from decimal import Decimal
+
+    from service.db import search_cache
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(db, [("a", 1, Decimal("1.00"), None)])
+            original = search_cache.fetch_catalogue
+            fetches = []
+            release = asyncio.Event()
+
+            async def slow(conn):
+                fetches.append(conn)
+                await release.wait()
+                return await original(conn)
+
+            monkeypatch.setattr(search_cache, "fetch_catalogue", slow)
+            abandoned = asyncio.create_task(search(db, q="mlijeko"))
+            while not fetches:
+                await asyncio.sleep(0.01)
+            waiter = asyncio.create_task(search(db, q="mlijeko", order="price_asc"))
+            await asyncio.sleep(0.05)
+            abandoned.cancel()
+            await asyncio.gather(abandoned, return_exceptions=True)
+            while len(fetches) < 2:
+                await asyncio.sleep(0.01)
+            concurrent = asyncio.create_task(search(db, q="mlijeko", city=["City"]))
+            await asyncio.sleep(0.05)
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(waiter, concurrent), 10)
+            assert len(fetches) == 2
+            assert all(result["total"] == 1 for result in results)
+
+    asyncio.run(run())
