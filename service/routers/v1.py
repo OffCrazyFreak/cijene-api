@@ -11,6 +11,7 @@ from service.config import settings
 from service.db.models import ChainStats, StorePrice
 from service.db.search import (
     MAX_QUERY_LENGTH,
+    CursorExpired,
     directory,
     latest_prices,
     normalize,
@@ -258,7 +259,7 @@ async def get_product(
     barcode. For products that don't have official EAN codes and use
     chain-specific codes, use the "chain:<product_code>" format.
 
-    Prices are the latest dated observations in one accepted generation.
+    Prices are the latest known dated observation per shop.
     Explicit historical dates are rejected.
     """
 
@@ -415,6 +416,8 @@ async def search_products(
             cursor=cursor,
         )
         return jsonable_encoder(result, custom_encoder={Decimal: str})
+    except CursorExpired as exc:
+        raise HTTPException(409, "cursor_expired") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

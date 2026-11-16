@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from service.db.search import search
+from service.db.search import CursorExpired, search
 from tests.service.import_fixtures import importer, write_day
 
 
@@ -31,7 +31,7 @@ def test_real_import_scoped_average_and_pinned_pages(database, tmp_path):
 
 
 @pytest.mark.parametrize("page_size", [137, 10000])
-def test_complete_relation_and_generation_paging(database, page_size):
+def test_complete_relation_paging_and_expired_cursor(database, page_size):
     async def run():
         async with database() as db:
             await db.create_tables()
@@ -48,7 +48,7 @@ def test_complete_relation_and_generation_paging(database, page_size):
                         "INSERT INTO chain_products(chain_id,product_id,code,name) SELECT 1,id,ean,'Mlijeko' FROM products"
                     )
                     await conn.execute(
-                        "INSERT INTO prices(chain_product_id,store_id,price_date,regular_price) SELECT id,1,'2026-11-14',CASE WHEN id=10001 THEN 0 ELSE 1.20 END FROM chain_products"
+                        "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price) SELECT id,1,'2026-11-14',CASE WHEN id=10001 THEN 0 ELSE 1.20 END FROM chain_products"
                     )
             first = await search(
                 db, q="mlijeko", page_size=page_size, order="price_asc"
@@ -58,10 +58,6 @@ def test_complete_relation_and_generation_paging(database, page_size):
             assert first["products"][0]["avg_price"] == 0
             ids = [p["ean"] for p in first["products"]]
             cursor = first["next_cursor"]
-            async with db.import_transaction():
-                await db._fetchval(
-                    "UPDATE prices SET regular_price=9 WHERE chain_product_id=10001 RETURNING id"
-                )
             while cursor:
                 page = await search(
                     db,
@@ -76,9 +72,22 @@ def test_complete_relation_and_generation_paging(database, page_size):
             assert len(ids) == len(set(ids)) == 10001
             with pytest.raises(ValueError, match="scope"):
                 await search(db, q="mlijeko", city="Other", cursor=first["next_cursor"])
-            assert (await search(db, q="mlijeko", order="price_asc"))["products"][0][
-                "ean"
-            ] != "10001"
+
+            async with db.import_transaction():
+                await db._fetchval(
+                    "UPDATE latest_offers SET regular_price=9 WHERE chain_product_id=10001 RETURNING store_id"
+                )
+            with pytest.raises(CursorExpired):
+                await search(
+                    db,
+                    q="mlijeko",
+                    page_size=page_size,
+                    order="price_asc",
+                    cursor=first["next_cursor"],
+                )
+            restarted = await search(db, q="mlijeko", order="price_asc")
+            assert restarted["generation"] > first["generation"]
+            assert restarted["products"][0]["ean"] != "10001"
 
     asyncio.run(run())
 
@@ -120,7 +129,7 @@ def test_authored_queries_through_postgres_retrieval(database):
                                 str(case["id"]),
                             )
                             await conn.execute(
-                                "INSERT INTO prices(chain_product_id,store_id,price_date,regular_price) VALUES($1,$2,'2026-11-14',1)",
+                                "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price) VALUES($1,$2,'2026-11-14',1)",
                                 cp,
                                 store,
                             )

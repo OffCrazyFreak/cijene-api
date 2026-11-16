@@ -18,7 +18,6 @@ from typing import (
 import asyncpg
 
 from .base import Database
-from .generations import backfill_legacy, publish
 from .models import (
     Chain,
     ChainProduct,
@@ -33,6 +32,46 @@ from .models import (
     StoreWithId,
     User,
 )
+
+
+DUPLICATE_CANONICAL_OFFERS = """
+    WITH aliases AS (
+        SELECT id, product_id FROM chain_products
+        WHERE (chain_id, product_id) IN (
+            SELECT chain_id, product_id FROM chain_products
+            WHERE product_id IS NOT NULL
+            GROUP BY chain_id, product_id
+            HAVING count(*) > 1
+        )
+    )
+    SELECT count(*) FROM (
+        SELECT 1 FROM latest_offers o
+        JOIN aliases a ON a.id = o.chain_product_id
+        GROUP BY a.product_id, o.store_id
+        HAVING count(*) > 1
+    ) duplicates
+"""
+
+
+async def _backfill_latest_offers(conn: asyncpg.Connection) -> None:
+    """Caller holds the writer lock and startup transaction."""
+    if await conn.fetchval("SELECT baseline_complete FROM import_state"):
+        return
+
+    await conn.execute("LOCK TABLE prices IN SHARE ROW EXCLUSIVE MODE")
+    await conn.execute(
+        """
+        INSERT INTO latest_offers
+        SELECT DISTINCT ON (chain_product_id, store_id)
+            chain_product_id, store_id, price_date, regular_price, special_price,
+            unit_price, best_price_30, anchor_price, available, anchor_price_date,
+            special_sale_type
+        FROM prices
+        ORDER BY chain_product_id, store_id, price_date DESC
+        ON CONFLICT DO NOTHING
+        """
+    )
+    await conn.execute("UPDATE import_state SET baseline_complete = TRUE")
 
 
 def _unique_batch[T](rows: list[T], key: Callable[[T], tuple]) -> list[T]:
@@ -167,7 +206,12 @@ class PostgresDatabase(Database):
                         + " WHERE id=$1",
                         [tuple(record) for record in records],
                     )
-            await publish(conn)
+            duplicates = await conn.fetchval(DUPLICATE_CANONICAL_OFFERS)
+            if duplicates:
+                self.logger.warning(
+                    f"{duplicates:,} shops list one barcode under several chain "
+                    "codes; reads use the newest offer"
+                )
 
     async def record_metadata_source_date(
         self, table: str, ids: list[int], source: date
@@ -201,7 +245,7 @@ class PostgresDatabase(Database):
                         (Path(__file__).parent / "migrations").glob("*.sql")
                     ):
                         await conn.execute(migration.read_text())
-                    await backfill_legacy(conn)
+                    await _backfill_latest_offers(conn)
                 self.logger.info("Database tables created successfully")
         except Exception as e:
             self.logger.error(f"Error creating tables: {e}")
@@ -268,16 +312,30 @@ class PostgresDatabase(Database):
             return [ChainStats(**row) for row in rows]
 
     async def add_store(self, store: Store) -> int:
+        # Skipping unchanged rows keeps an identical replay from expiring cursors.
         return await self._fetchval(
             """
-            INSERT INTO stores (chain_id, code, type, address, city, zipcode)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (chain_id, code) DO UPDATE SET
-                type = COALESCE($3, stores.type),
-                address = COALESCE($4, stores.address),
-                city = COALESCE($5, stores.city),
-                zipcode = COALESCE($6, stores.zipcode)
-            RETURNING id
+            WITH upserted AS (
+                INSERT INTO stores (chain_id, code, type, address, city, zipcode)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (chain_id, code) DO UPDATE SET
+                    type = COALESCE($3, stores.type),
+                    address = COALESCE($4, stores.address),
+                    city = COALESCE($5, stores.city),
+                    zipcode = COALESCE($6, stores.zipcode)
+                WHERE (stores.type, stores.address, stores.city, stores.zipcode)
+                    IS DISTINCT FROM (
+                        COALESCE($3, stores.type),
+                        COALESCE($4, stores.address),
+                        COALESCE($5, stores.city),
+                        COALESCE($6, stores.zipcode)
+                    )
+                RETURNING id
+            )
+            SELECT id FROM upserted
+            UNION ALL
+            SELECT id FROM stores WHERE chain_id = $1 AND code = $2
+            LIMIT 1
             """,
             store.chain_id,
             store.code,
@@ -294,10 +352,6 @@ class PostgresDatabase(Database):
                 yield conn
             return
         async with self._writer_transaction("metadata") as conn:
-            if await self.cleanup_is_protected():
-                raise RuntimeError(
-                    "Accepted metadata changes require import_transaction"
-                )
             yield conn
 
     async def update_store(
@@ -823,6 +877,23 @@ class PostgresDatabase(Database):
                     special_sale_type = EXCLUDED.special_sale_type
                 """
             )
+            await conn.execute(
+                """
+                INSERT INTO latest_offers SELECT * FROM temp_prices
+                ON CONFLICT (chain_product_id, store_id) DO UPDATE SET
+                    price_date = EXCLUDED.price_date,
+                    regular_price = EXCLUDED.regular_price,
+                    special_price = EXCLUDED.special_price,
+                    unit_price = EXCLUDED.unit_price,
+                    best_price_30 = EXCLUDED.best_price_30,
+                    anchor_price = EXCLUDED.anchor_price,
+                    available = EXCLUDED.available,
+                    anchor_price_date = EXCLUDED.anchor_price_date,
+                    special_sale_type = EXCLUDED.special_sale_type
+                WHERE EXCLUDED.price_date >= latest_offers.price_date
+                    AND ROW(latest_offers.*) IS DISTINCT FROM ROW(EXCLUDED.*)
+                """
+            )
             await conn.execute("DROP TABLE temp_prices")
             _, _, rowcount = result.split(" ")
             rowcount = int(rowcount)
@@ -887,6 +958,21 @@ class PostgresDatabase(Database):
                     category = EXCLUDED.category,
                     unit = EXCLUDED.unit,
                     quantity = EXCLUDED.quantity
+                WHERE (
+                    chain_products.product_id,
+                    chain_products.name,
+                    chain_products.brand,
+                    chain_products.category,
+                    chain_products.unit,
+                    chain_products.quantity
+                ) IS DISTINCT FROM (
+                    EXCLUDED.product_id,
+                    EXCLUDED.name,
+                    EXCLUDED.brand,
+                    EXCLUDED.category,
+                    EXCLUDED.unit,
+                    EXCLUDED.quantity
+                )
                 """
             )
             await conn.execute("DROP TABLE temp_chain_products")
@@ -1054,20 +1140,8 @@ class PostgresDatabase(Database):
         """
         return condition, [price_date, chain_ids]
 
-    async def cleanup_is_protected(self) -> bool:
-        return bool(
-            await self._fetchval(
-                "SELECT EXISTS(SELECT 1 FROM generations WHERE accepted_at IS NOT NULL)"
-            )
-        )
-
     async def count_prices_before(self, before: date) -> dict[date, int]:
         async with self._writer_transaction("cleanup"):
-            if await self.cleanup_is_protected():
-                self.logger.warning(
-                    "Accepted generations protect all legacy prices; cleanup disabled"
-                )
-                return {}
             return await self._count_prices_before(before)
 
     async def _count_prices_before(self, before: date) -> dict[date, int]:
@@ -1086,8 +1160,6 @@ class PostgresDatabase(Database):
 
     async def delete_prices_before(self, before: date) -> dict[date, int]:
         async with self._cleanup_connection():
-            if await self.cleanup_is_protected():
-                raise RuntimeError("Accepted generations disable destructive cleanup")
             deleted = await self._delete_prices_before(before)
         if deleted:
             await self._vacuum_prices(sum(deleted.values()))

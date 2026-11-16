@@ -58,7 +58,7 @@ def test_latest_http_contract(database, service_client, tmp_path):
     asyncio.run(run())
 
 
-def test_request_keeps_generation_during_publication(database, tmp_path):
+def test_request_keeps_snapshot_during_import(database, tmp_path):
     from contextlib import asynccontextmanager
 
     from service.db.search import search
@@ -80,7 +80,7 @@ def test_request_keeps_generation_during_publication(database, tmp_path):
                         return getattr(self.conn, name)
 
                     async def fetch(self, query, *args):
-                        if "SELECT DISTINCT cp.name" in query:
+                        if "SELECT DISTINCT name" in query:
                             pinned.set()
                             await asyncio.wait_for(published.wait(), 10)
                         return await self.conn.fetch(query, *args)
@@ -164,7 +164,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                                 unit,
                             )
                         await conn.execute(
-                            "INSERT INTO prices(chain_product_id,store_id,price_date,regular_price) SELECT cp.id,s.id,'2026-11-14',1 FROM chain_products cp CROSS JOIN stores s WHERE cp.id<>9"
+                            "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price) SELECT cp.id,s.id,'2026-11-14',1 FROM chain_products cp CROSS JOIN stores s WHERE cp.id<>9"
                         )
                 headers = {"Authorization": f"Bearer {token}"}
 
@@ -234,7 +234,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
 def test_city_alias_facets_keep_labels_and_unique_products(database, service_client):
     import asyncio
     import json
-    from tests.service.test_generation_migration import legacy
+    from tests.service.test_latest_migration import legacy
 
     async def run():
         async with database() as db:

@@ -73,13 +73,6 @@ async def clean_prices(days: int, dry_run: bool) -> None:
         dry_run: Only count and log the rows to delete.
     """
     before = date.today() - timedelta(days=days)
-    if await db.cleanup_is_protected():
-        if dry_run:
-            logger.warning(
-                "Dry run: accepted generations protect all prices; cleanup disabled"
-            )
-            return
-        raise RuntimeError("Accepted generations disable destructive cleanup")
     await warn_stale_chains(before)
 
     if dry_run:

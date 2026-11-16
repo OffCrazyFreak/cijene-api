@@ -15,6 +15,10 @@ SQL = Path(__file__).with_name("latest.sql").read_text()
 MAX_QUERY_LENGTH = 256
 
 
+class CursorExpired(Exception):
+    """The data changed since the cursor was issued; the client restarts."""
+
+
 def selection(value: str | None) -> set[str]:
     return {normalize(v) for v in (value or "").split(",") if normalize(v)}
 
@@ -26,15 +30,15 @@ def decode_cursor(value: str) -> dict[str, Any]:
         result = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
         if not isinstance(result, dict) or set(result) != {
             "v",
-            "generation",
+            "epoch",
             "scope",
             "key",
         }:
             raise ValueError
         if (
-            result["v"] != 1
-            or type(result["generation"]) is not int
-            or not 1 <= result["generation"] <= 9223372036854775807
+            result["v"] != 2
+            or type(result["epoch"]) is not int
+            or not 0 <= result["epoch"] <= 9223372036854775807
         ):
             raise ValueError
         if not isinstance(result["scope"], str) or not isinstance(result["key"], list):
@@ -44,12 +48,12 @@ def decode_cursor(value: str) -> dict[str, Any]:
         raise ValueError("Invalid cursor") from exc
 
 
-def encode_cursor(generation: int, scope: str, key: list[Any]) -> str:
+def encode_cursor(epoch: int, scope: str, key: list[Any]) -> str:
     return base64.urlsafe_b64encode(
         json.dumps(
             {
-                "v": 1,
-                "generation": generation,
+                "v": 2,
+                "epoch": epoch,
                 "scope": scope,
                 "key": key,
             },
@@ -151,48 +155,24 @@ async def search(
         raise ValueError("Cursor scope or order changed")
     async with database._get_conn() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
-            generation = (
-                decoded["generation"]
-                if decoded
-                else await conn.fetchval(
-                    "SELECT active_id FROM publication_state WHERE singleton"
-                )
+            epoch = await conn.fetchval("SELECT epoch FROM import_state")
+            if decoded and decoded["epoch"] != epoch:
+                raise CursorExpired
+            return await serving_search(
+                conn,
+                epoch,
+                scope,
+                decoded,
+                q,
+                chains,
+                city,
+                brand,
+                category,
+                order,
+                page_size,
+                identity,
+                city_labels,
             )
-            if generation is not None:
-                if not await conn.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM generations WHERE id=$1 AND accepted_at IS NOT NULL)",
-                    generation,
-                ):
-                    raise ValueError("Generation unavailable; restart search")
-                return await serving_search(
-                    conn,
-                    generation,
-                    scope,
-                    decoded,
-                    q,
-                    chains,
-                    city,
-                    brand,
-                    category,
-                    order,
-                    page_size,
-                    identity,
-                    city_labels,
-                )
-    return evaluate(
-        [],
-        generation,
-        scope,
-        decoded,
-        q,
-        chains,
-        city,
-        brand,
-        category,
-        order,
-        page_size,
-        identity,
-    )
 
 
 def evaluate(
@@ -359,22 +339,19 @@ def evaluate(
     }
 
 
+STORE_COLUMNS = "s.id,s.chain_id,s.code,s.type,s.address,s.city,s.zipcode,s.lat,s.lon,s.phone,c.code AS chain"
+
+
 async def directory(database: Any, kind: str) -> list[dict[str, Any]]:
     if kind not in {"chain", "store"}:
         raise ValueError("Unsupported directory")
+    query = (
+        "SELECT id,code,created_at FROM chains ORDER BY id"
+        if kind == "chain"
+        else f"SELECT {STORE_COLUMNS} FROM stores s JOIN chains c ON c.id=s.chain_id ORDER BY s.id"
+    )
     async with database._get_conn() as conn:
-        return [
-            dict(row)
-            for row in await conn.fetch(
-                f"SELECT v.*{',c.code AS chain' if kind == 'store' else ''} FROM publication_state ps JOIN generation_{kind}s m ON m.generation_id=ps.active_id JOIN {kind}_versions v USING(version_id) "
-                + (
-                    "JOIN generation_chains cm ON cm.generation_id=m.generation_id AND cm.id=v.chain_id JOIN chain_versions c ON c.version_id=cm.version_id "
-                    if kind == "store"
-                    else ""
-                )
-                + "ORDER BY v.id"
-            )
-        ]
+        return [dict(row) for row in await conn.fetch(query)]
 
 
 async def latest_prices(
@@ -382,27 +359,18 @@ async def latest_prices(
 ) -> list[dict[str, Any]]:
     async with database._get_conn() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
-            generation = await conn.fetchval(
-                "SELECT active_id FROM publication_state WHERE singleton"
-            )
             stores = await conn.fetch(
-                "SELECT s.*,c.code chain FROM generation_stores m JOIN store_versions s USING(version_id) JOIN generation_chains cm ON cm.generation_id=m.generation_id AND cm.id=s.chain_id JOIN chain_versions c ON c.version_id=cm.version_id WHERE m.generation_id=$1",
-                generation,
+                f"SELECT {STORE_COLUMNS} FROM stores s JOIN chains c ON c.id=s.chain_id"
             )
             store_ids = [r["id"] for r in store_filter([dict(r) for r in stores])]
-            rows = (
-                [
-                    dict(row)
-                    for row in await conn.fetch(
-                        SQL + " AND p.ean=ANY($2::text[]) AND s.id=ANY($3::bigint[])",
-                        generation,
-                        list(eans),
-                        store_ids,
-                    )
-                ]
-                if generation
-                else []
-            )
+            rows = [
+                dict(row)
+                for row in await conn.fetch(
+                    SQL + " AND p.ean=ANY($1::text[]) AND s.id=ANY($2::bigint[])",
+                    list(eans),
+                    store_ids,
+                )
+            ]
             shops = {}
             for row in sorted(
                 rows, key=lambda row: (row["chain"], row["code"], row["store_code"])
@@ -413,7 +381,7 @@ async def latest_prices(
 
 async def serving_search(
     conn: Any,
-    generation: int,
+    epoch: int,
     scope: str,
     decoded: dict[str, Any] | None,
     q: str,
@@ -427,12 +395,7 @@ async def serving_search(
     city_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     metadata = await conn.fetch(
-        """
-        SELECT DISTINCT cp.name,cp.brand,cp.quantity,cp.unit
-        FROM generation_chain_products m JOIN chain_product_versions cp USING(version_id)
-        WHERE m.generation_id=$1
-    """,
-        generation,
+        "SELECT DISTINCT name,brand,quantity,unit FROM chain_products"
     )
     known_brands = {
         token for row in metadata for token in normalize(row["brand"] or "").split()
@@ -455,15 +418,14 @@ async def serving_search(
         """WITH variants AS (
         SELECT x->>0 name,x->>1 brand,x->>2 quantity,x->>3 unit,
                (x->>4)::int intent,(x->>5)::int quality
-        FROM jsonb_array_elements($2::jsonb) x
+        FROM jsonb_array_elements($1::jsonb) x
     ), candidates AS MATERIALIZED (
         SELECT p.ean,min(v.intent*10+v.quality) rank
-        FROM generation_chain_products m JOIN chain_product_versions cp USING(version_id)
+        FROM chain_products cp
         JOIN variants v ON cp.name=v.name AND cp.brand IS NOT DISTINCT FROM v.brand
           AND cp.quantity IS NOT DISTINCT FROM v.quantity AND cp.unit IS NOT DISTINCT FROM v.unit
-        JOIN generation_products pm ON pm.generation_id=m.generation_id AND pm.id=cp.product_id
-        JOIN product_versions p ON p.version_id=pm.version_id
-        WHERE m.generation_id=$1 AND ($3::text IS NULL OR p.ean=$3)
+        JOIN products p ON p.id=cp.product_id
+        WHERE ($2::text IS NULL OR p.ean=$2)
         GROUP BY p.ean
     ), raw AS MATERIALIZED ("""
         + SQL
@@ -473,7 +435,6 @@ async def serving_search(
     ) """
     )
     args: list[Any] = [
-        generation,
         json.dumps(scores, default=str),
         normalize_barcode(identity) or identity if identity else None,
     ]
@@ -487,7 +448,7 @@ async def serving_search(
     for facet, wanted in filters.items():
         values = (
             await conn.fetch(
-                accepted + f"SELECT DISTINCT {facet} FROM matching", *args[:3]
+                accepted + f"SELECT DISTINCT {facet} FROM matching", *args[:2]
             )
             if wanted
             else []
@@ -500,7 +461,7 @@ async def serving_search(
     accepted = accepted.replace(
         "FROM raw",
         "FROM raw WHERE "
-        + " AND ".join(f"${i}::text[] IS NOT NULL" for i in range(4, 8)),
+        + " AND ".join(f"${i}::text[] IS NOT NULL" for i in range(3, 7)),
     )
     # Every facet excludes only its own selection from the same accepted relation.
     facets = {}
@@ -582,9 +543,7 @@ async def serving_search(
         products = [item for item in products if comparator(item[0]) > boundary]
     page = products[:page_size]
     next_cursor = (
-        encode_cursor(generation, scope, page[-1][0])
-        if len(products) > len(page)
-        else None
+        encode_cursor(epoch, scope, page[-1][0]) if len(products) > len(page) else None
     )
     args.append([r["ean"] for _, r in page])
     chain_rows = await conn.fetch(
@@ -646,7 +605,7 @@ async def serving_search(
         finish(product)
     return dict(
         products=[p for _, p in page],
-        generation=generation,
+        generation=epoch,
         total=total,
         next_cursor=next_cursor,
         facets=facets,
@@ -660,10 +619,7 @@ async def chain_statistics(database: Any) -> list[Any]:
     async with database._get_conn() as conn:
         rows = await conn.fetch(
             "WITH offers AS ("
-            + SQL.replace(
-                "m.generation_id=$1",
-                "m.generation_id=(SELECT active_id FROM publication_state WHERE singleton)",
-            )
+            + SQL
             + "), shops AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM offers ORDER BY ean,chain,store_code,code) SELECT chain,max(price_date) price_date,count(*) price_count,count(DISTINCT store_code) store_count FROM shops GROUP BY chain ORDER BY chain"
         )
 
