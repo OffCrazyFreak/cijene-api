@@ -117,10 +117,28 @@ def relevance(
     unit: str | None = None,
     known_brands: set[str] | None = None,
 ) -> tuple[int, int] | None:
-    tokens = normalize(query).split()
-    words = normalize(name + " " + brand).split()
+    return score_words(
+        normalize(query).split(),
+        normalize(name + " " + brand).split(),
+        normalize(brand).split(),
+        quantity,
+        unit,
+        known_brands,
+    )
+
+
+def score_words(
+    tokens: list[str],
+    words: list[str],
+    brand_words: list[str],
+    quantity: str | None = None,
+    unit: str | None = None,
+    known_brands: set[str] | None = None,
+) -> tuple[int, int] | None:
+    """relevance() over already normalized query tokens and name and brand words."""
+    words = list(words)
     requested_brands = (known_brands or set()) & set(tokens)
-    if requested_brands and not requested_brands <= set(normalize(brand).split()):
+    if requested_brands and not requested_brands <= set(brand_words):
         return None
     for index in pack_pairs(tokens):
         amount = Decimal(tokens[index])
@@ -142,9 +160,7 @@ def relevance(
         if (target_unit, amount * factor) not in packs:
             return None
         words.extend(tokens[index : index + 2])
-    substitution_words = [
-        word for word in words if word not in normalize(brand).split()
-    ]
+    substitution_words = [word for word in words if word not in brand_words]
     quality = 0
     for token in tokens:
         if token in words:

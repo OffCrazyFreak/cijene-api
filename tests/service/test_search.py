@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 
 from service.db.matching import relevance, normalize
@@ -201,5 +203,55 @@ def test_http_long_query_rejected(database, service_client):
                     headers={"Authorization": "Bearer length-fixture"},
                 )
                 assert result.status_code == 422
+
+    asyncio.run(run())
+
+
+def test_later_pages_reuse_the_cached_ordering(database):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from decimal import Decimal
+
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(
+                db, [(ean, 1, Decimal("1.00"), None) for ean in ("a", "b", "c")]
+            )
+            orderings = []
+            original = db._get_conn
+
+            class Counted:
+                def __init__(self, conn):
+                    self.conn = conn
+
+                def __getattr__(self, name):
+                    return getattr(self.conn, name)
+
+                async def fetchrow(self, query, *args):
+                    orderings.append(query)
+                    return await self.conn.fetchrow(query, *args)
+
+            @asynccontextmanager
+            async def counted():
+                async with original() as conn:
+                    yield Counted(conn)
+
+            with patch.object(db, "_get_conn", counted):
+                first = await search(db, q="mlijeko", page_size=1)
+                second = await search(
+                    db, q="mlijeko", page_size=1, cursor=first["next_cursor"]
+                )
+                third = await search(
+                    db, q="mlijeko", page_size=1, cursor=second["next_cursor"]
+                )
+            assert len(orderings) == 1
+            assert [p["ean"] for p in first["products"] + second["products"]] == [
+                "a",
+                "b",
+            ]
+            assert third["products"][0]["ean"] == "c" and third["next_cursor"] is None
 
     asyncio.run(run())

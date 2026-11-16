@@ -4,18 +4,29 @@ import asyncio
 import base64
 import hashlib
 import json
-from collections import defaultdict
+from bisect import bisect_right
 from collections.abc import Iterable
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 from common.barcodes import normalize_barcode
 from service.db.matching import normalize
-from service.db.vocabulary import CatalogueRow, vocabulary_cache
+from service.db.scoped_offers import (
+    LATEST_OFFERS,
+    Statement,
+    ordering_sql,
+    page_sql,
+)
+from service.db.search_cache import Catalogue, Ordering, SortKey, search_cache
 
-SQL = Path(__file__).with_name("latest.sql").read_text()
 MAX_QUERY_LENGTH = 256
+PRICE_COLUMNS = """
+    p.ean,c.id AS chain_id,c.code AS chain,s.code AS store_code,
+    s.city,s.address,s.lat,s.lon,s.type,s.zipcode,s.phone,
+    cp.id AS chain_product_id,cp.code,
+    o.price_date,o.regular_price,o.special_price,o.unit_price,
+    o.best_price_30,o.anchor_price,'unknown' AS listing_status
+"""
 
 
 class CursorExpired(Exception):
@@ -54,6 +65,28 @@ def decode_cursor(value: str) -> dict[str, Any]:
         return result
     except (ValueError, TypeError, UnicodeError) as exc:
         raise ValueError("Invalid cursor") from exc
+
+
+def cursor_boundary(key: list[Any]) -> SortKey:
+    if (
+        len(key) != 6
+        or any(type(key[i]) is not int for i in (0, 1, 3, 4))
+        or not isinstance(key[2], str)
+        or not isinstance(key[5], str)
+    ):
+        raise ValueError("Invalid cursor comparator")
+    try:
+        price = Decimal(key[2])
+    except ArithmeticError as exc:
+        raise ValueError("Invalid cursor price") from exc
+    if not price.is_finite():
+        raise ValueError("Invalid cursor price")
+    return key[0], key[1], price, key[3], key[4], key[5]
+
+
+def cursor_key(key: SortKey) -> list[Any]:
+    group, quality, price, shops, chains, ean = key
+    return [group, quality, str(price), shops, chains, ean]
 
 
 def encode_cursor(epoch: int, scope: str, key: list[Any]) -> str:
@@ -106,12 +139,16 @@ async def search(
         raise ValueError("page_size must be between 1 and 10000")
     if q and len(normalize(q).replace(" ", "")) < 2:
         raise ValueError("Text search requires two visible characters")
+
+    wanted = {
+        "chain": selection(chains),
+        "city": literal_selection(city),
+        "brand": literal_selection(brand),
+        "category": literal_selection(category),
+    }
     scope_data = [
         normalize(q),
-        sorted(selection(chains)),
-        sorted(literal_selection(city)),
-        sorted(literal_selection(brand)),
-        sorted(literal_selection(category)),
+        *(sorted(values) for values in wanted.values()),
         order,
         identity,
         sorted((city_labels or {}).items()),
@@ -120,27 +157,133 @@ async def search(
     decoded = decode_cursor(cursor) if cursor else None
     if decoded and decoded["scope"] != scope:
         raise ValueError("Cursor scope or order changed")
+    boundary = cursor_boundary(decoded["key"]) if decoded else None
+
     async with database._get_conn() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             epoch = await conn.fetchval("SELECT epoch FROM import_state")
             if decoded and decoded["epoch"] != epoch:
                 raise CursorExpired
-            return await serving_search(
-                database,
-                conn,
-                epoch,
-                scope,
-                decoded,
-                q,
-                chains,
-                city,
-                brand,
-                category,
-                order,
-                page_size,
-                identity,
-                city_labels,
+
+            cache = search_cache(database)
+            catalogue = (
+                await cache.catalogue(epoch, conn)
+                if normalize(q) or any(wanted.values())
+                else None
             )
+            filters = {
+                facet: catalogue.resolve(facet, values)
+                if catalogue and values
+                else None
+                for facet, values in wanted.items()
+            }
+
+            ordering = cache.ordering(epoch, scope)
+            if ordering is None:
+                ordering = await scope_ordering(
+                    conn,
+                    catalogue,
+                    q,
+                    filters,
+                    normalize_barcode(identity) or identity if identity else None,
+                    city_labels or {},
+                    order,
+                )
+                cache.remember(epoch, scope, ordering)
+
+            start = bisect_right(ordering.keys, boundary) if boundary else 0
+            page = ordering.keys[start : start + page_size]
+            products = await page_products(conn, filters, [key[5] for key in page])
+
+    has_more = start + len(page) < len(ordering.keys)
+    return dict(
+        products=products,
+        generation=epoch,
+        total=len(ordering.keys),
+        next_cursor=encode_cursor(epoch, scope, cursor_key(page[-1]))
+        if has_more
+        else None,
+        facets=ordering.facets,
+        outside_location_total=ordering.outside,
+        complete=True,
+        partial=True,
+    )
+
+
+async def scope_ordering(
+    conn: Any,
+    catalogue: Catalogue | None,
+    q: str,
+    filters: dict[str, list[str] | None],
+    identity: str | None,
+    city_labels: dict[str, str],
+    order: str,
+) -> Ordering:
+    matched = (
+        await asyncio.to_thread(catalogue.vocabulary.match, q)
+        if catalogue and normalize(q)
+        else None
+    )
+    statement = Statement(filters)
+    sql = ordering_sql(statement, identity, matched, city_labels, order)
+    row = await conn.fetchrow(sql, *statement.args)
+
+    keys: list[SortKey] = []
+    for ean, rank, min_price, shops, chains in zip(
+        row["ean"],
+        row["rank"],
+        row["min_price"],
+        row["shop_count"],
+        row["chain_count"],
+        strict=True,
+    ):
+        price = {"relevance": Decimal(0), "price_asc": min_price}.get(order, -min_price)
+        keys.append((rank // 10, rank % 10, price, -shops, -chains, ean))
+
+    facets = {facet: json.loads(row[facet]) for facet in filters}
+    return Ordering(keys, facets, row["outside"])
+
+
+def unit_prices(row: dict[str, Any]) -> dict[str, Any]:
+    prices = {k: row.pop(k) for k in ("mass", "volume", "pieces")}
+    return {k: v for k, v in prices.items() if v is not None}
+
+
+async def page_products(
+    conn: Any, filters: dict[str, list[str] | None], eans: list[str]
+) -> list[dict[str, Any]]:
+    if not eans:
+        return []
+
+    statement = Statement(filters)
+    sql = page_sql(statement, eans)
+    products: dict[str, dict[str, Any]] = {}
+    for record in await conn.fetch(sql, *statement.args):
+        row = dict(record)
+        row["unit_prices"] = unit_prices(row)
+        row.update(partial=True, listing_status="unknown")
+        if row["chain"] is None:
+            products[row["ean"]] = product_summary(row)
+        else:
+            chain = {k: v for k, v in row.items() if not k.startswith("product_")}
+            del chain["ean"]
+            products[row["ean"]]["chains"].append(chain)
+    return [products[ean] for ean in eans]
+
+
+def product_summary(row: dict[str, Any]) -> dict[str, Any]:
+    product = {
+        k: v
+        for k, v in row.items()
+        if k not in ("chain", "code", "category") and not k.startswith("product_")
+    }
+    for field in ("name", "brand", "quantity", "unit"):
+        own = row["product_" + field]
+        product[field] = own if own is not None else row[field]
+    if product["quantity"] is not None:
+        product["quantity"] = str(product["quantity"])
+    product["chains"] = []
+    return product
 
 
 STORE_COLUMNS = "s.id,s.chain_id,s.code,s.type,s.address,s.city,s.zipcode,s.lat,s.lon,s.phone,c.code AS chain"
@@ -179,7 +322,8 @@ async def latest_prices(
             rows = [
                 dict(row)
                 for row in await conn.fetch(
-                    SQL + " AND p.ean=ANY($1::text[]) AND s.id=ANY($2::bigint[])",
+                    f"SELECT {PRICE_COLUMNS} {LATEST_OFFERS} "
+                    "WHERE p.ean=ANY($1::text[]) AND s.id=ANY($2::bigint[])",
                     list(eans),
                     store_ids,
                 )
@@ -190,252 +334,18 @@ async def latest_prices(
             return list(shops.values())
 
 
-async def matched_chain_products(
-    database: Any, conn: Any, epoch: int, q: str
-) -> tuple[list[int], list[int]] | None:
-    if not normalize(q):
-        return None
-
-    async def load() -> list[CatalogueRow]:
-        rows = await conn.fetch(
-            "SELECT id,name,brand,quantity,unit FROM chain_products"
-        )
-        return [tuple(row) for row in rows]
-
-    index = await vocabulary_cache(database).get(epoch, load)
-    return await asyncio.to_thread(index.match, q)
-
-
-async def serving_search(
-    database: Any,
-    conn: Any,
-    epoch: int,
-    scope: str,
-    decoded: dict[str, Any] | None,
-    q: str,
-    chains: str | None,
-    city: list[str] | None,
-    brand: list[str] | None,
-    category: list[str] | None,
-    order: str,
-    page_size: int,
-    identity: str | None,
-    city_labels: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    identity_value = normalize_barcode(identity) or identity if identity else None
-    matched = await matched_chain_products(database, conn, epoch, q)
-    if matched is None:
-        candidates = (
-            "SELECT ean,0 rank FROM products WHERE ($1::text IS NULL OR ean=$1)"
-        )
-        args: list[Any] = [identity_value]
-    else:
-        candidates = """
-        SELECT p.ean,min(m.rank) rank
-        FROM unnest($2::bigint[],$3::int[]) m(id,rank)
-        JOIN chain_products cp ON cp.id=m.id
-        JOIN products p ON p.id=cp.product_id
-        WHERE ($1::text IS NULL OR p.ean=$1)
-        GROUP BY p.ean"""
-        args = [identity_value, *matched]
-    candidate_args = len(args)
-    accepted = (
-        "WITH candidates AS MATERIALIZED ("
-        + candidates
-        + "), raw AS MATERIALIZED ("
-        + SQL
-        + " AND p.ean IN (SELECT ean FROM candidates)"
-        + """), matching AS (
-        SELECT raw.*,((SELECT jsonb_object_agg(ean,rank) FROM candidates)->>raw.ean)::int rank FROM raw
-    ) """
-    )
-    filters = dict(
-        chain=selection(chains),
-        city=literal_selection(city),
-        brand=literal_selection(brand),
-        category=literal_selection(category),
-    )
-    clauses = {}
-    for facet, wanted in filters.items():
-        values = (
-            await conn.fetch(
-                accepted + f"SELECT DISTINCT {facet} FROM matching",
-                *args[:candidate_args],
-            )
-            if wanted
-            else []
-        )
-        allowed = sorted(
-            {r[facet] for r in values if r[facet] and normalize(r[facet]) in wanted}
-        )
-        args.append(allowed)
-        clauses[facet] = f"{facet}=ANY(${len(args)}::text[])" if wanted else "TRUE"
-    accepted = accepted.replace(
-        "FROM raw",
-        "FROM raw WHERE "
-        + " AND ".join(
-            f"${i}::text[] IS NOT NULL"
-            for i in range(candidate_args + 1, candidate_args + 5)
-        ),
-    )
-    # Every facet excludes only its own selection from the same accepted relation.
-    facets = {}
-    for facet in filters:
-        predicate = " AND ".join(v for k, v in clauses.items() if k != facet)
-        value = (
-            f"COALESCE((${len(args) + 1}::jsonb)->>city,city)"
-            if facet == "city"
-            else facet
-        )
-        facet_args = [*args, json.dumps(city_labels or {})] if facet == "city" else args
-        records = await conn.fetch(
-            accepted
-            + f"SELECT {value} value,count(DISTINCT ean) count FROM matching WHERE {predicate} AND {facet} IS NOT NULL AND {facet}<>'' GROUP BY {value} ORDER BY {value}",
-            *facet_args,
-        )
-        facets[facet] = {r["value"]: r["count"] for r in records}
-    outside = await conn.fetchval(
-        accepted
-        + "SELECT count(DISTINCT ean) FROM matching WHERE "
-        + " AND ".join(v for k, v in clauses.items() if k != "city"),
-        *args,
-    )
-    relation = (
-        accepted
-        + ", eligible AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM matching WHERE "
-        + " AND ".join(clauses.values())
-        + " ORDER BY ean,chain,store_code,price_date DESC,chain_product_id), priced AS (SELECT *,least(regular_price,special_price) effective FROM eligible) "
-    )
-    aggregate = """ min(effective) min_price,max(effective) max_price,avg(effective) avg_price,
-        count(*) shop_count,count(DISTINCT chain) chain_count,
-        min(price_date) min_price_date,max(price_date) max_price_date,max(price_date) price_date,
-        avg(effective / NULLIF(quantity::numeric * CASE lower(unit) WHEN 'g' THEN .001 ELSE 1 END,0)) FILTER(WHERE lower(unit) IN ('g','kg') AND quantity ~ '^[0-9]+([.][0-9]+)?$') mass,
-        avg(effective / NULLIF(quantity::numeric * CASE lower(unit) WHEN 'ml' THEN .001 ELSE 1 END,0)) FILTER(WHERE lower(unit) IN ('ml','l') AND quantity ~ '^[0-9]+([.][0-9]+)?$') volume,
-        avg(effective / NULLIF(quantity::numeric,0)) FILTER(WHERE lower(unit)='kom' AND quantity ~ '^[0-9]+([.][0-9]+)?$') pieces """
-    rows = await conn.fetch(
-        relation
-        + "SELECT ean,min(rank) rank,"
-        + aggregate
-        + " FROM priced GROUP BY ean",
-        *args,
-    )
-    products = []
-    for record in rows:
-        row = dict(record)
-        price_key = row["min_price"] if order != "relevance" else Decimal(0)
-        if order == "price_desc":
-            price_key = -price_key
-        key = [
-            row.pop("rank") // 10,
-            record["rank"] % 10,
-            str(price_key),
-            -row["shop_count"],
-            -row["chain_count"],
-            row["ean"],
-        ]
-        products.append((key, row))
-
-    def comparator(key: list[Any]) -> tuple[Any, ...]:
-        if (
-            len(key) != 6
-            or any(type(key[i]) is not int for i in (0, 1, 3, 4))
-            or not isinstance(key[2], str)
-            or not isinstance(key[5], str)
-        ):
-            raise ValueError("Invalid cursor comparator")
-        try:
-            number = Decimal(key[2])
-            if not number.is_finite():
-                raise ValueError("Invalid cursor price")
-        except ArithmeticError as exc:
-            raise ValueError("Invalid cursor price") from exc
-        return key[0], key[1], number, key[3], key[4], key[5]
-
-    products.sort(key=lambda item: comparator(item[0]))
-    total = len(products)
-    if decoded:
-        boundary = comparator(decoded["key"])
-        products = [item for item in products if comparator(item[0]) > boundary]
-    page = products[:page_size]
-    next_cursor = (
-        encode_cursor(epoch, scope, page[-1][0]) if len(products) > len(page) else None
-    )
-    args.append([r["ean"] for _, r in page])
-    chain_rows = await conn.fetch(
-        relation
-        + "SELECT ean,chain,(array_agg(code ORDER BY code,store_code))[1] code,"
-        + ",".join(
-            f"(array_agg({k} ORDER BY code,store_code))[1] {k}"
-            for k in (
-                "name",
-                "brand",
-                "category",
-                "quantity",
-                "unit",
-                "product_name",
-                "product_brand",
-                "product_quantity",
-                "product_unit",
-            )
-        )
-        + ","
-        + aggregate
-        + f" FROM priced WHERE ean=ANY(${len(args)}::text[]) GROUP BY ean,chain ORDER BY ean,chain",
-        *args,
-    )
-
-    def finish(row: dict[str, Any]) -> dict[str, Any]:
-        row["unit_prices"] = {
-            k: row.pop(k) for k in ("mass", "volume", "pieces") if row[k] is not None
-        }
-        for k in ("mass", "volume", "pieces"):
-            row.pop(k, None)
-        row.update(partial=True, listing_status="unknown")
-        return row
-
-    by_ean: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in chain_rows:
-        by_ean[record["ean"]].append(dict(record))
-    for _, product in page:
-        members = by_ean[product["ean"]]
-        first = members[0]
-        for field in ("name", "brand", "quantity", "unit"):
-            product[field] = (
-                first["product_" + field]
-                if first["product_" + field] is not None
-                else first[field]
-            )
-        if product["quantity"] is not None:
-            product["quantity"] = str(product["quantity"])
-        product["chains"] = [
-            finish(
-                {
-                    k: v
-                    for k, v in r.items()
-                    if not k.startswith("product_") and k != "ean"
-                }
-            )
-            for r in members
-        ]
-        finish(product)
-    return dict(
-        products=[p for _, p in page],
-        generation=epoch,
-        total=total,
-        next_cursor=next_cursor,
-        facets=facets,
-        outside_location_total=outside,
-        complete=True,
-        partial=True,
-    )
-
-
 async def chain_statistics(database: Any) -> list[Any]:
     async with database._get_conn() as conn:
-        rows = await conn.fetch(
-            "WITH offers AS ("
-            + SQL
-            + "), shops AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM offers ORDER BY ean,chain,store_code,price_date DESC,chain_product_id) SELECT chain,max(price_date) price_date,count(*) price_count,count(DISTINCT store_code) store_count FROM shops GROUP BY chain ORDER BY chain"
+        return await conn.fetch(
+            f"""
+            WITH shops AS (
+                SELECT DISTINCT ON (p.ean,c.code,s.code)
+                    c.code AS chain,s.code AS store_code,o.price_date
+                {LATEST_OFFERS}
+                ORDER BY p.ean,c.code,s.code,o.price_date DESC,cp.id
+            )
+            SELECT chain,max(price_date) price_date,count(*) price_count,
+                   count(DISTINCT store_code) store_count
+            FROM shops GROUP BY chain ORDER BY chain
+            """
         )
-
-    return rows

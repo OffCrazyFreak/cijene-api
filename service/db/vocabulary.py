@@ -1,12 +1,9 @@
 """Per-epoch catalogue vocabulary that narrows relevance() to plausible variants."""
 
-import asyncio
 from array import array
 from bisect import bisect_left
-from collections import OrderedDict, defaultdict
-from collections.abc import Awaitable, Callable, Iterable
-from typing import Any
-from weakref import WeakKeyDictionary
+from collections import defaultdict
+from collections.abc import Iterable
 
 from service.db.matching import (
     EDIT_MIN_LENGTH,
@@ -15,7 +12,7 @@ from service.db.matching import (
     edit_budget,
     normalize,
     pack_pairs,
-    relevance,
+    score_words,
     token_distance,
 )
 
@@ -35,6 +32,7 @@ class VocabularyIndex:
 
     def __init__(self, rows: Iterable[CatalogueRow]):
         self.variants: list[Variant] = []
+        self.variant_words: list[tuple[list[str], list[str]]] = []
         self.chain_products: list[array] = []
         self.known_brands: set[str] = set()
         self.postings: dict[str, array] = defaultdict(lambda: array("I"))
@@ -60,9 +58,12 @@ class VocabularyIndex:
         self.chain_products.append(array("q"))
 
         name, brand, _, _ = variant
-        for word in set(normalize(name + " " + brand).split()):
+        words = normalize(name + " " + brand).split()
+        brand_words = normalize(brand).split()
+        self.variant_words.append((words, brand_words))
+        for word in set(words):
             self.postings[word].append(variant_id)
-        self.known_brands.update(normalize(brand).split())
+        self.known_brands.update(brand_words)
         return variant_id
 
     def _words_for(self, token: str) -> Iterable[str]:
@@ -113,59 +114,18 @@ class VocabularyIndex:
 
     def match(self, query: str) -> tuple[list[int], list[int]]:
         """Chain product ids and their rank for every variant relevance() accepts."""
+        tokens = normalize(query).split()
         ids: list[int] = []
         ranks: list[int] = []
         for variant_id in self.candidates(query):
-            name, brand, quantity, unit = self.variants[variant_id]
-            score = relevance(query, name, brand, quantity, unit, self.known_brands)
+            _, _, quantity, unit = self.variants[variant_id]
+            words, brand_words = self.variant_words[variant_id]
+            score = score_words(
+                tokens, words, brand_words, quantity, unit, self.known_brands
+            )
             if score is None:
                 continue
             members = self.chain_products[variant_id]
             ids.extend(members)
             ranks.extend([score[0] * 10 + score[1]] * len(members))
         return ids, ranks
-
-
-class VocabularyCache:
-    """Keeps the newest indexes and lets one build per epoch finish after a timeout."""
-
-    def __init__(self, size: int = 2):
-        self.size = size
-        self.indexes: OrderedDict[int, VocabularyIndex] = OrderedDict()
-        self.pending: dict[int, asyncio.Task[VocabularyIndex]] = {}
-
-    async def get(
-        self, epoch: int, load: Callable[[], Awaitable[list[CatalogueRow]]]
-    ) -> VocabularyIndex:
-        if epoch in self.indexes:
-            self.indexes.move_to_end(epoch)
-            return self.indexes[epoch]
-
-        build = self.pending.get(epoch)
-        if build is None or build.get_loop() is not asyncio.get_running_loop():
-            rows = await load()
-            build = asyncio.create_task(asyncio.to_thread(VocabularyIndex, rows))
-            self.pending[epoch] = build
-            build.add_done_callback(lambda task: self._store(epoch, task))
-
-        # A cancelled request must not discard a build the next request reuses.
-        return await asyncio.shield(build)
-
-    def _store(self, epoch: int, build: asyncio.Task[VocabularyIndex]) -> None:
-        if self.pending.get(epoch) is build:
-            del self.pending[epoch]
-        if build.cancelled() or build.exception() is not None:
-            return
-        self.indexes[epoch] = build.result()
-        while len(self.indexes) > self.size:
-            del self.indexes[min(self.indexes)]
-
-
-_caches: WeakKeyDictionary[Any, VocabularyCache] = WeakKeyDictionary()
-
-
-def vocabulary_cache(database: Any) -> VocabularyCache:
-    cache = _caches.get(database)
-    if cache is None:
-        cache = _caches[database] = VocabularyCache()
-    return cache

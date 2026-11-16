@@ -79,14 +79,10 @@ def test_request_keeps_snapshot_during_import(database, tmp_path):
                     def __getattr__(self, name):
                         return getattr(self.conn, name)
 
-                    async def fetch(self, query, *args):
-                        if (
-                            "SELECT id,name,brand,quantity,unit FROM chain_products"
-                            in query
-                        ):
-                            pinned.set()
-                            await asyncio.wait_for(published.wait(), 10)
-                        return await self.conn.fetch(query, *args)
+                    async def fetchrow(self, query, *args):
+                        pinned.set()
+                        await asyncio.wait_for(published.wait(), 10)
+                        return await self.conn.fetchrow(query, *args)
 
                 @asynccontextmanager
                 async def connection():
@@ -179,7 +175,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                     return response.json()
 
                 calls = []
-                original = matcher.relevance
+                original = matcher.score_words
 
                 def counted(*args, **kwargs):
                     calls.append(args)
@@ -209,7 +205,7 @@ def test_review_blockers_http_and_bounded_matching(database, service_client):
                 tracemalloc.start()
                 started = time.monotonic()
                 with (
-                    patch.object(matcher, "relevance", counted),
+                    patch.object(matcher, "score_words", counted),
                     patch.object(db, "_get_conn", observed_connection),
                 ):
                     data = await get("limun")
@@ -315,5 +311,24 @@ def test_repeated_literal_filters_keep_commas(database, service_client):
                 assert await eans({"city": ["Split", "Zadar"]}) == ["1", "2", "3"]
                 assert await eans({"chains": "one,two"}) == ["1", "2", "3"]
                 assert await eans({"chains": "two"}) == ["3"]
+
+                headers = {"Authorization": "Bearer filters-fixture"}
+                first = await client.get(
+                    "/v1/products/",
+                    params={"q": "jabuka", "page_size": 1},
+                    headers=headers,
+                )
+                cursor = first.json()["next_cursor"]
+                async with db.import_transaction():
+                    await db._fetchval(
+                        "UPDATE latest_offers SET regular_price=2 WHERE chain_product_id=1 RETURNING store_id"
+                    )
+                expired = await client.get(
+                    "/v1/products/",
+                    params={"q": "jabuka", "page_size": 1, "cursor": cursor},
+                    headers=headers,
+                )
+                assert expired.status_code == 409
+                assert expired.json() == {"detail": "cursor_expired"}
 
     asyncio.run(run())
