@@ -288,7 +288,7 @@ async def scope_ordering(
     return Ordering(keys, facets, row["outside"])
 
 
-def unit_prices(row: dict[str, Any]) -> dict[str, Any]:
+def pop_unit_prices(row: dict[str, Any]) -> dict[str, Any]:
     prices = {k: row.pop(k) for k in ("mass", "volume", "pieces")}
     return {k: v for k, v in prices.items() if v is not None}
 
@@ -304,7 +304,7 @@ async def page_products(
     products: dict[str, dict[str, Any]] = {}
     for record in await conn.fetch(sql, *statement.args):
         row = dict(record)
-        row["unit_prices"] = unit_prices(row)
+        row["unit_prices"] = pop_unit_prices(row)
         row.update(partial=True, listing_status="unknown")
         if row["chain"] is None:
             products[row["ean"]] = product_summary(row)
