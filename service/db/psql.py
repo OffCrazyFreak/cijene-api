@@ -74,7 +74,7 @@ async def _backfill_latest_offers(conn: asyncpg.Connection) -> None:
 
     await conn.execute("LOCK TABLE prices IN SHARE ROW EXCLUSIVE MODE")
     # Legacy imports stored a missing special price as 0, which would win every price sort.
-    await conn.execute(
+    copied = await conn.execute(
         """
         INSERT INTO latest_offers
         SELECT DISTINCT ON (chain_product_id, store_id)
@@ -96,6 +96,15 @@ async def _backfill_latest_offers(conn: asyncpg.Connection) -> None:
         """
     )
     await conn.execute("UPDATE import_state SET baseline_complete = TRUE")
+    if _affected_rows(copied):
+        await conn.execute(BUMP_IMPORT_EPOCH)
+
+
+BUMP_IMPORT_EPOCH = "UPDATE import_state SET epoch = epoch + 1"
+
+
+def _affected_rows(status: str) -> int:
+    return int(status.rsplit(" ", 1)[-1])
 
 
 def _unique_batch[T](rows: list[T], key: Callable[[T], tuple]) -> list[T]:
@@ -114,6 +123,7 @@ class _TransactionContext:
     connection: asyncpg.Connection
     mode: str
     duplicate_shops: set[tuple[int, int]] = field(default_factory=set)
+    changed_tables: set[str] = field(default_factory=set)
 
 
 class PostgresDatabase(Database):
@@ -161,10 +171,29 @@ class PostgresDatabase(Database):
 
     @asynccontextmanager
     async def _atomic(self) -> AsyncIterator[asyncpg.Connection]:
-        """Context manager for atomic transactions."""
+        # A savepoint per batch inside a whole-archive import kept every batch's memory until commit.
+        if self._import_conn.get() is not None:
+            async with self._get_conn() as conn:
+                yield conn
+            return
+
         async with self._get_conn() as conn:
             async with conn.transaction():
                 yield conn
+
+    async def _note_change(
+        self, conn: asyncpg.Connection, table: str, affected: int
+    ) -> None:
+        """Move the epoch once per writing transaction, so unchanged replays keep cursors valid."""
+        if not affected:
+            return
+
+        context = self._import_conn.get()
+        if context is None:
+            await conn.execute(BUMP_IMPORT_EPOCH)
+            return
+
+        context.changed_tables.add(table)
 
     @asynccontextmanager
     async def _writer_transaction(self, mode: str):
@@ -173,13 +202,15 @@ class PostgresDatabase(Database):
         async with self._get_conn() as conn:
             async with conn.transaction(isolation="read_committed"):
                 await conn.execute("SELECT pg_advisory_xact_lock(73198421)")
-                token = self._import_conn.set(
-                    _TransactionContext(asyncio.current_task(), conn, mode)
-                )
+                context = _TransactionContext(asyncio.current_task(), conn, mode)
+                token = self._import_conn.set(context)
                 try:
                     yield conn
                 finally:
                     self._import_conn.reset(token)
+
+                if context.changed_tables:
+                    await conn.execute(BUMP_IMPORT_EPOCH)
 
     @asynccontextmanager
     async def _cleanup_connection(self):
@@ -223,6 +254,7 @@ class PostgresDatabase(Database):
             for table, records in preserved.items():
                 columns = fields[table].split(",")
                 if records:
+                    await self._note_change(conn, table, len(records))
                     await conn.executemany(
                         f"UPDATE {table} SET "
                         + ",".join(
@@ -313,6 +345,8 @@ class PostgresDatabase(Database):
             )
             if chain_id is None:
                 raise RuntimeError(f"Failed to insert chain {chain.code}")
+
+            await self._note_change(conn, "chains", 1)
             return chain_id
 
     async def list_chains(self) -> list[ChainWithId]:
@@ -341,8 +375,12 @@ class PostgresDatabase(Database):
             return [ChainStats(**row) for row in rows]
 
     async def add_store(self, store: Store) -> int:
+        async with self._atomic() as conn:
+            return await self._upsert_store(conn, store)
+
+    async def _upsert_store(self, conn: asyncpg.Connection, store: Store) -> int:
         # Skipping unchanged rows keeps an identical replay from expiring cursors.
-        store_id = await self._fetchval(
+        store_id = await conn.fetchval(
             """
             INSERT INTO stores (chain_id, code, type, address, city, zipcode)
             VALUES ($1, $2, $3, $4, $5, $6)
@@ -368,14 +406,19 @@ class PostgresDatabase(Database):
             store.zipcode or None,
         )
         if store_id is not None:
+            await self._note_change(conn, "stores", 1)
             return store_id
 
         # A separate statement sees a row that a concurrent writer committed meanwhile.
-        return await self._fetchval(
+        existing = await conn.fetchval(
             "SELECT id FROM stores WHERE chain_id = $1 AND code = $2",
             store.chain_id,
             store.code,
         )
+        if existing is None:
+            raise RuntimeError(f"Failed to upsert store {store.code}")
+
+        return existing
 
     @asynccontextmanager
     async def _metadata_connection(self):
@@ -424,8 +467,8 @@ class PostgresDatabase(Database):
                 lon or None,
                 phone or None,
             )
-            _, rowcount = result.split(" ")
-            return int(rowcount) == 1
+            await self._note_change(conn, "stores", _affected_rows(result))
+            return _affected_rows(result) == 1
 
     async def list_stores(self, chain_code: str) -> list[StoreWithId]:
         async with self._get_conn() as conn:
@@ -519,10 +562,16 @@ class PostgresDatabase(Database):
         Returns:
             The database ID of the created product.
         """
-        return await self._fetchval(
-            "INSERT INTO products (ean) VALUES ($1) RETURNING id",
-            ean,
-        )
+        async with self._atomic() as conn:
+            product_id = await conn.fetchval(
+                "INSERT INTO products (ean) VALUES ($1) RETURNING id",
+                ean,
+            )
+            if product_id is None:
+                raise RuntimeError(f"Failed to insert product {ean}")
+
+            await self._note_change(conn, "products", 1)
+            return product_id
 
     async def get_products_by_ean(self, ean: list[str]) -> list[ProductWithId]:
         async with self._get_conn() as conn:
@@ -639,8 +688,8 @@ class PostgresDatabase(Database):
                 product.quantity,
                 product.unit,
             )
-            _, rowcount = result.split(" ")
-            return int(rowcount) == 1
+            await self._note_change(conn, "products", _affected_rows(result))
+            return _affected_rows(result) == 1
 
     async def get_chain_products_for_product(
         self,
@@ -865,7 +914,7 @@ class PostgresDatabase(Database):
                 """,
                 *columns,
             )
-            await conn.execute(
+            latest = await conn.execute(
                 f"""
                 INSERT INTO latest_offers
                 SELECT DISTINCT ON (chain_product_id, store_id) * FROM {STAGED_PRICES}
@@ -885,7 +934,9 @@ class PostgresDatabase(Database):
                 """,
                 *columns,
             )
-            await conn.execute(
+            await self._note_change(conn, "latest_offers", _affected_rows(latest))
+
+            import_dates = await conn.execute(
                 f"""
                 INSERT INTO chain_import_dates
                 SELECT cp.chain_id, max(t.price_date) FROM {STAGED_PRICES}
@@ -896,6 +947,10 @@ class PostgresDatabase(Database):
                 """,
                 *columns,
             )
+            await self._note_change(
+                conn, "chain_import_dates", _affected_rows(import_dates)
+            )
+
             duplicates = {
                 (row["product_id"], row["store_id"])
                 for row in await conn.fetch(DUPLICATE_CANONICAL_OFFERS, *columns)
@@ -905,8 +960,7 @@ class PostgresDatabase(Database):
                 self._warn_duplicate_shops(duplicates)
             else:
                 context.duplicate_shops.update(duplicates)
-            _, _, rowcount = result.split(" ")
-            return int(rowcount)
+            return _affected_rows(result)
 
     async def add_many_chain_products(
         self,
@@ -958,8 +1012,8 @@ class PostgresDatabase(Database):
                 """,
                 *([getattr(row, field) for row in chain_products] for field in fields),
             )
-            _, _, rowcount = result.split(" ")
-            return int(rowcount)
+            await self._note_change(conn, "chain_products", _affected_rows(result))
+            return _affected_rows(result)
 
     async def compute_chain_prices(self, date: date) -> None:
         async with self._get_conn() as conn:

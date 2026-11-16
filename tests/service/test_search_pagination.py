@@ -77,7 +77,8 @@ def test_complete_relation_paging_and_expired_cursor(database, page_size):
 
             async with db.import_transaction():
                 await db._fetchval(
-                    "UPDATE latest_offers SET regular_price=9 WHERE chain_product_id=10001 RETURNING store_id"
+                    "WITH changed AS (UPDATE latest_offers SET regular_price=9 WHERE chain_product_id=10001 RETURNING store_id) "
+                    "UPDATE import_state SET epoch=epoch+1 WHERE EXISTS(SELECT 1 FROM changed) RETURNING epoch"
                 )
             with pytest.raises(CursorExpired):
                 await search(

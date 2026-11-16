@@ -371,3 +371,28 @@ def test_many_batches_keep_the_lock_count_flat(database):
             assert await db._fetchval("SELECT count(*) FROM prices") == 28
 
     asyncio.run(run())
+
+
+def test_import_opens_no_savepoints_and_moves_the_epoch_once(database, tmp_path):
+    from asyncpg.connection import Connection
+
+    opened = []
+    original = Connection.transaction
+
+    def counting_transaction(self, *args, **kwargs):
+        opened.append(self.is_in_transaction())
+        return original(self, *args, **kwargs)
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            with (
+                patch.object(importer, "db", db),
+                patch.object(Connection, "transaction", counting_transaction),
+            ):
+                await importer.import_directory(write_day(tmp_path), False)
+
+            assert True not in opened
+            assert await db._fetchval("SELECT epoch FROM import_state") == 1
+
+    asyncio.run(run())

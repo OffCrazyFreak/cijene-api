@@ -204,6 +204,8 @@ def test_cleanup_cli_deletes_old_dates(database, monkeypatch, caplog):
 
 
 def test_epoch_moves_once_per_changing_transaction(database):
+    from service.db.models import Product
+
     async def run():
         async with database() as db:
             await legacy(db)
@@ -212,23 +214,39 @@ def test_epoch_moves_once_per_changing_transaction(database):
             async def epoch():
                 return await db._fetchval("SELECT epoch FROM import_state")
 
-            async with db._get_conn() as conn:
-                async with conn.transaction():
-                    await conn.execute("UPDATE chain_products SET name='Renamed'")
-                    await conn.execute("UPDATE stores SET city='City'")
-                assert await epoch() == 2
+            assert await epoch() == 1
 
-                await conn.execute("UPDATE chain_products SET name='Renamed'")
-                await conn.execute(
-                    "UPDATE chain_products SET metadata_source_date='2026-11-14'"
-                )
+            async with db.import_transaction():
+                await db.update_store(1, "old", city="City")
+                await db.update_product(Product(ean="123", name="Renamed"))
+            assert await epoch() == 2
+
+            async with db.import_transaction():
+                await db.record_metadata_source_date("stores", [1], date(2026, 11, 14))
+            assert await epoch() == 2
+
+            async with db._get_conn() as conn:
                 await conn.execute("UPDATE prices SET regular_price=7")
                 assert await epoch() == 2
 
-                await conn.execute("UPDATE latest_offers SET regular_price=7")
+                await conn.execute("TRUNCATE latest_offers")
                 assert await epoch() == 3
 
-                await conn.execute("TRUNCATE latest_offers")
-                assert await epoch() == 4
+    asyncio.run(run())
+
+
+def test_served_tables_have_no_row_copying_triggers(database):
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await db.create_tables()
+            triggers = await db._fetchval(
+                """
+                SELECT count(*) FROM pg_trigger
+                WHERE NOT tgisinternal
+                    AND (tgoldtable IS NOT NULL OR tgnewtable IS NOT NULL)
+                """
+            )
+            assert triggers == 0
 
     asyncio.run(run())

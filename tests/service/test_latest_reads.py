@@ -335,7 +335,8 @@ def test_repeated_literal_filters_keep_commas(database, service_client):
                 cursor = first.json()["next_cursor"]
                 async with db.import_transaction():
                     await db._fetchval(
-                        "UPDATE latest_offers SET regular_price=2 WHERE chain_product_id=1 RETURNING store_id"
+                        "WITH changed AS (UPDATE latest_offers SET regular_price=2 WHERE chain_product_id=1 RETURNING store_id) "
+                        "UPDATE import_state SET epoch=epoch+1 WHERE EXISTS(SELECT 1 FROM changed) RETURNING epoch"
                     )
                 expired = await client.get(
                     "/v1/products/",
