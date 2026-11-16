@@ -323,3 +323,51 @@ def test_partial_marks_carried_forward_offers(database, tmp_path):
             assert (await search(db, q="mlijeko", city=["City"]))["partial"] is False
 
     asyncio.run(run())
+
+
+def test_many_batches_keep_the_lock_count_flat(database):
+    from datetime import date
+    from decimal import Decimal
+
+    from service.db.models import ChainProduct, Price
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            async with db.import_transaction():
+                async with db._get_conn() as conn:
+                    await conn.execute("""
+                        INSERT INTO chains(code) VALUES('test');
+                        INSERT INTO stores(chain_id,code) VALUES(1,'1');
+                        INSERT INTO products(ean) VALUES('1');
+                    """)
+
+                    async def locks():
+                        return await conn.fetchval(
+                            "SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid()"
+                        )
+
+                    async def batch(day):
+                        await db.add_many_chain_products(
+                            [
+                                ChainProduct(
+                                    chain_id=1,
+                                    product_id=1,
+                                    code="1",
+                                    name=f"Mlijeko {day}",
+                                )
+                            ]
+                        )
+                        await db.add_many_prices(
+                            [Price(1, 1, date(2026, 1, 1 + day % 28), Decimal(day))]
+                        )
+
+                    await batch(0)
+                    await batch(1)
+                    early = await locks()
+                    for day in range(2, 150):
+                        await batch(day)
+                    assert await locks() == early
+            assert await db._fetchval("SELECT count(*) FROM prices") == 28
+
+    asyncio.run(run())

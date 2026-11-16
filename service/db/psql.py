@@ -34,9 +34,32 @@ from .models import (
 )
 
 
-DUPLICATE_CANONICAL_OFFERS = """
+PRICE_FIELDS = (
+    "chain_product_id",
+    "store_id",
+    "price_date",
+    "regular_price",
+    "special_price",
+    "unit_price",
+    "best_price_30",
+    "anchor_price",
+    "available",
+    "anchor_price_date",
+    "special_sale_type",
+)
+# Arrays instead of a temp table per batch: a dropped temp table keeps its lock until commit.
+STAGED_PRICES = (
+    """unnest(
+    $1::int[], $2::int[], $3::date[], $4::numeric[], $5::numeric[], $6::numeric[],
+    $7::numeric[], $8::numeric[], $9::boolean[], $10::date[], $11::text[]
+) AS t("""
+    + ",".join(PRICE_FIELDS)
+    + ")"
+)
+
+DUPLICATE_CANONICAL_OFFERS = f"""
     SELECT DISTINCT cp.product_id, t.store_id
-    FROM temp_prices t
+    FROM {STAGED_PRICES}
     JOIN chain_products cp ON cp.id = t.chain_product_id
     JOIN chain_products other ON other.product_id = cp.product_id
         AND other.chain_id = cp.chain_id AND other.id <> cp.id
@@ -822,59 +845,14 @@ class PostgresDatabase(Database):
         prices = _unique_batch(
             prices, lambda row: (row.chain_product_id, row.store_id, row.price_date)
         )
+        columns = [
+            [getattr(price, field) for price in prices] for field in PRICE_FIELDS
+        ]
         async with self._atomic() as conn:
-            await conn.execute(
-                """
-                CREATE TEMP TABLE temp_prices (
-                    chain_product_id INTEGER,
-                    store_id INTEGER,
-                    price_date DATE,
-                    regular_price DECIMAL(10, 2),
-                    special_price DECIMAL(10, 2),
-                    unit_price DECIMAL(10, 2),
-                    best_price_30 DECIMAL(10, 2),
-                    anchor_price DECIMAL(10, 2),
-                    available BOOLEAN,
-                    anchor_price_date DATE,
-                    special_sale_type VARCHAR(255)
-                )
-                """
-            )
-            await conn.copy_records_to_table(
-                "temp_prices",
-                records=(
-                    (
-                        p.chain_product_id,
-                        p.store_id,
-                        p.price_date,
-                        p.regular_price,
-                        p.special_price,
-                        p.unit_price,
-                        p.best_price_30,
-                        p.anchor_price,
-                        p.available,
-                        p.anchor_price_date,
-                        p.special_sale_type,
-                    )
-                    for p in prices
-                ),
-            )
             result = await conn.execute(
-                """
-                INSERT INTO prices(
-                    chain_product_id,
-                    store_id,
-                    price_date,
-                    regular_price,
-                    special_price,
-                    unit_price,
-                    best_price_30,
-                    anchor_price,
-                    available,
-                    anchor_price_date,
-                    special_sale_type
-                )
-                SELECT * from temp_prices
+                f"""
+                INSERT INTO prices({",".join(PRICE_FIELDS)})
+                SELECT * FROM {STAGED_PRICES}
                 ON CONFLICT (chain_product_id, store_id, price_date) DO UPDATE SET
                     regular_price = EXCLUDED.regular_price,
                     special_price = EXCLUDED.special_price,
@@ -884,12 +862,13 @@ class PostgresDatabase(Database):
                     available = EXCLUDED.available,
                     anchor_price_date = EXCLUDED.anchor_price_date,
                     special_sale_type = EXCLUDED.special_sale_type
-                """
+                """,
+                *columns,
             )
             await conn.execute(
-                """
+                f"""
                 INSERT INTO latest_offers
-                SELECT DISTINCT ON (chain_product_id, store_id) * FROM temp_prices
+                SELECT DISTINCT ON (chain_product_id, store_id) * FROM {STAGED_PRICES}
                 ORDER BY chain_product_id, store_id, price_date DESC
                 ON CONFLICT (chain_product_id, store_id) DO UPDATE SET
                     price_date = EXCLUDED.price_date,
@@ -903,31 +882,31 @@ class PostgresDatabase(Database):
                     special_sale_type = EXCLUDED.special_sale_type
                 WHERE EXCLUDED.price_date >= latest_offers.price_date
                     AND ROW(latest_offers.*) IS DISTINCT FROM ROW(EXCLUDED.*)
-                """
+                """,
+                *columns,
             )
             await conn.execute(
-                """
+                f"""
                 INSERT INTO chain_import_dates
-                SELECT cp.chain_id, max(t.price_date) FROM temp_prices t
+                SELECT cp.chain_id, max(t.price_date) FROM {STAGED_PRICES}
                 JOIN chain_products cp ON cp.id = t.chain_product_id
                 GROUP BY cp.chain_id
                 ON CONFLICT (chain_id) DO UPDATE SET price_date = EXCLUDED.price_date
                 WHERE EXCLUDED.price_date > chain_import_dates.price_date
-                """
+                """,
+                *columns,
             )
             duplicates = {
                 (row["product_id"], row["store_id"])
-                for row in await conn.fetch(DUPLICATE_CANONICAL_OFFERS)
+                for row in await conn.fetch(DUPLICATE_CANONICAL_OFFERS, *columns)
             }
             context = self._import_conn.get()
             if context is None:
                 self._warn_duplicate_shops(duplicates)
             else:
                 context.duplicate_shops.update(duplicates)
-            await conn.execute("DROP TABLE temp_prices")
             _, _, rowcount = result.split(" ")
-            rowcount = int(rowcount)
-            return rowcount
+            return int(rowcount)
 
     async def add_many_chain_products(
         self,
@@ -936,51 +915,24 @@ class PostgresDatabase(Database):
         chain_products = _unique_batch(
             chain_products, lambda row: (row.chain_id, row.code)
         )
+        fields = (
+            "chain_id",
+            "product_id",
+            "code",
+            "name",
+            "brand",
+            "category",
+            "unit",
+            "quantity",
+        )
         async with self._atomic() as conn:
-            await conn.execute(
-                """
-                CREATE TEMP TABLE temp_chain_products (
-                    chain_id INTEGER,
-                    product_id INTEGER,
-                    code VARCHAR(100),
-                    name VARCHAR(255),
-                    brand VARCHAR(255),
-                    category VARCHAR(255),
-                    unit VARCHAR(50),
-                    quantity VARCHAR(50)
-                )
-                """
-            )
-            await conn.copy_records_to_table(
-                "temp_chain_products",
-                records=(
-                    (
-                        cp.chain_id,
-                        cp.product_id,
-                        cp.code,
-                        cp.name,
-                        cp.brand,
-                        cp.category,
-                        cp.unit,
-                        cp.quantity,
-                    )
-                    for cp in chain_products
-                ),
-            )
-
             result = await conn.execute(
-                """
-                INSERT INTO chain_products(
-                    chain_id,
-                    product_id,
-                    code,
-                    name,
-                    brand,
-                    category,
-                    unit,
-                    quantity
+                f"""
+                INSERT INTO chain_products({",".join(fields)})
+                SELECT * FROM unnest(
+                    $1::int[], $2::int[], $3::text[], $4::text[],
+                    $5::text[], $6::text[], $7::text[], $8::text[]
                 )
-                SELECT * from temp_chain_products
                 ON CONFLICT (chain_id, code) DO UPDATE SET
                     product_id = EXCLUDED.product_id,
                     name = EXCLUDED.name,
@@ -1003,13 +955,11 @@ class PostgresDatabase(Database):
                     EXCLUDED.unit,
                     EXCLUDED.quantity
                 )
-                """
+                """,
+                *([getattr(row, field) for row in chain_products] for field in fields),
             )
-            await conn.execute("DROP TABLE temp_chain_products")
-
             _, _, rowcount = result.split(" ")
-            rowcount = int(rowcount)
-            return rowcount
+            return int(rowcount)
 
     async def compute_chain_prices(self, date: date) -> None:
         async with self._get_conn() as conn:
