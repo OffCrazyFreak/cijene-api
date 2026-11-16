@@ -309,7 +309,7 @@ async def serving_search(
     products = []
     for record in rows:
         row = dict(record)
-        price_key = row["avg_price"] if order != "relevance" else Decimal(0)
+        price_key = row["min_price"] if order != "relevance" else Decimal(0)
         if order == "price_desc":
             price_key = -price_key
         key = [

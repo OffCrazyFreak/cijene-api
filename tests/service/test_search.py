@@ -1,3 +1,5 @@
+import pytest
+
 from service.db.matching import relevance, normalize
 
 
@@ -125,6 +127,33 @@ def test_cursor_retains_exact_decimal_comparator(database):
                 "a",
                 "b",
             ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"), [("price_asc", ["a", "b"]), ("price_desc", ["b", "a"])]
+)
+def test_price_orders_use_lowest_scoped_price(database, order, expected):
+    import asyncio
+    from decimal import Decimal
+
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(
+                db,
+                [
+                    ("a", 1, Decimal("1.00"), None),
+                    ("a", 2, Decimal("9.00"), None),
+                    ("b", 1, Decimal("3.00"), None),
+                ],
+            )
+            result = await search(db, q="mlijeko", order=order)
+            assert [p["ean"] for p in result["products"]] == expected
+            assert result["products"][expected.index("a")]["avg_price"] == 5
 
     asyncio.run(run())
 
