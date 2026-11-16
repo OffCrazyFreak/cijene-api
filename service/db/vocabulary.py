@@ -12,7 +12,10 @@ from service.db.matching import (
     STRICT,
     edit_budget,
     normalize,
+    PackSize,
     pack_pairs,
+    pack_size,
+    pack_sizes,
     score_words,
     token_distance,
 )
@@ -37,6 +40,7 @@ class VocabularyIndex:
         self.chain_products: list[array] = []
         self.known_brands: set[str] = set()
         self.postings: dict[str, array] = defaultdict(lambda: array("I"))
+        self.pack_postings: dict[PackSize, array] = defaultdict(lambda: array("I"))
 
         variant_ids: dict[Variant, int] = {}
         for chain_product_id, name, brand, quantity, unit in rows:
@@ -58,13 +62,15 @@ class VocabularyIndex:
         self.variants.append(variant)
         self.chain_products.append(array("q"))
 
-        name, brand, _, _ = variant
+        name, brand, quantity, unit = variant
         # Interning shares one string per distinct word across all variants.
         words = tuple(intern(word) for word in normalize(name + " " + brand).split())
         brand_words = tuple(intern(word) for word in normalize(brand).split())
         self.variant_words.append((words, brand_words))
         for word in set(words):
             self.postings[word].append(variant_id)
+        for size in set(pack_sizes(words, quantity, unit)):
+            self.pack_postings[size].append(variant_id)
         self.known_brands.update(brand_words)
         return variant_id
 
@@ -98,17 +104,24 @@ class VocabularyIndex:
             found.update(self.postings[word])
         return found
 
+    def _variants_with_pack(self, amount: str, unit: str) -> set[int]:
+        size = pack_size(amount, unit)
+        return set(self.pack_postings.get(size, ())) if size else set()
+
     def candidates(self, query: str) -> Iterable[int]:
         """Every variant that relevance() could accept, possibly with extras."""
         tokens = normalize(query).split()
-        satisfied_by_packs = {
-            tokens[i + offset] for i in pack_pairs(tokens) for offset in (0, 1)
-        }
+        pairs = pack_pairs(tokens)
+        satisfied_by_packs = {tokens[i + offset] for i in pairs for offset in (0, 1)}
         constrained = {token for token in tokens if token not in satisfied_by_packs}
-        if not constrained:
+        if not constrained and not pairs:
             return range(len(self.variants))
 
-        matches = sorted((self._variants_for(token) for token in constrained), key=len)
+        word_matches = (self._variants_for(token) for token in constrained)
+        pack_matches = (
+            self._variants_with_pack(tokens[i], tokens[i + 1]) for i in pairs
+        )
+        matches = sorted([*word_matches, *pack_matches], key=len)
         result = matches[0]
         for other in matches[1:]:
             result &= other

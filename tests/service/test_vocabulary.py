@@ -110,6 +110,11 @@ def generated_queries() -> list[str]:
         "čokolada milka",
         "ockolada",
         "zz",
+        "500 g",
+        "0.5 kg",
+        "1000 ml mlijeko",
+        "6 l",
+        "snan l",
     ]
     return queries
 
@@ -147,4 +152,5 @@ def test_candidates_shrink_the_scored_set():
     rows = fixture_catalogue()
     index = VocabularyIndex(rows)
     assert len(list(index.candidates("mlijeko"))) < len(index.variants) / 4
-    assert len(list(index.candidates("1 l"))) == len(index.variants)
+    assert len(list(index.candidates("1 l"))) < len(index.variants) / 2
+    assert len(list(index.candidates("500 g"))) < len(index.variants) / 2
