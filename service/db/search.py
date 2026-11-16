@@ -15,12 +15,22 @@ from asyncpg.exceptions import QueryCanceledError
 from common.barcodes import normalize_barcode
 from service.db.matching import normalize
 from service.db.scoped_offers import (
+    FACETS,
     LATEST_OFFERS,
     Statement,
     ordering_sql,
     page_sql,
 )
-from service.db.search_cache import Catalogue, Ordering, SortKey, search_cache
+from service.db.search_cache import (
+    Catalogue,
+    FacetValues,
+    Ordering,
+    SearchCache,
+    SortKey,
+    group_facet_values,
+    resolve_filter,
+    search_cache,
+)
 
 MAX_QUERY_LENGTH = 256
 SEARCH_STATEMENT_TIMEOUT = "10s"
@@ -210,16 +220,9 @@ async def search_snapshot(database: Any, request: ScopeRequest) -> dict[str, Any
 
             cache = search_cache(database)
             catalogue = (
-                await cache.catalogue(epoch, conn)
-                if normalize(request.q) or any(request.wanted.values())
-                else None
+                await cache.catalogue(epoch, conn) if normalize(request.q) else None
             )
-            filters = {
-                facet: catalogue.resolve(facet, values)
-                if catalogue and values
-                else None
-                for facet, values in request.wanted.items()
-            }
+            filters = await resolve_filters(conn, cache, epoch, catalogue, request)
 
             ordering = cache.ordering(epoch, request.scope)
             if ordering is None:
@@ -245,6 +248,38 @@ async def search_snapshot(database: Any, request: ScopeRequest) -> dict[str, Any
         complete=True,
         partial=ordering.partial,
     )
+
+
+async def resolve_filters(
+    conn: Any,
+    cache: SearchCache,
+    epoch: int,
+    catalogue: Catalogue | None,
+    request: ScopeRequest,
+) -> dict[str, list[str] | None]:
+    if not any(request.wanted.values()):
+        return dict.fromkeys(request.wanted)
+
+    # A barcode lookup resolves filters from its own offers instead of the whole catalogue.
+    if request.identity is not None:
+        facet_values = await identity_facet_values(conn, request.identity)
+    else:
+        catalogue = catalogue or await cache.catalogue(epoch, conn)
+        facet_values = catalogue.facet_values
+
+    return {
+        facet: resolve_filter(facet_values[facet], wanted) if wanted else None
+        for facet, wanted in request.wanted.items()
+    }
+
+
+async def identity_facet_values(conn: Any, identity: str) -> FacetValues:
+    rows = await conn.fetch(
+        f"SELECT DISTINCT c.code AS chain,s.city,cp.brand,cp.category {LATEST_OFFERS} "
+        "WHERE p.ean=$1",
+        identity,
+    )
+    return group_facet_values({facet: [row[facet] for row in rows] for facet in FACETS})
 
 
 def price_key(order: str, min_price: Decimal) -> Decimal:

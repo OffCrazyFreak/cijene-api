@@ -360,3 +360,29 @@ def test_cold_requests_share_one_catalogue_build(database, monkeypatch):
             assert all(result["total"] == 1 for result in results)
 
     asyncio.run(run())
+
+
+def test_barcode_filters_skip_the_catalogue(database, monkeypatch):
+    import asyncio
+    from decimal import Decimal
+
+    from service.db import search_cache
+    from service.db.search import search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(db, [("12345678", 1, Decimal("1.00"), None)])
+
+            async def unexpected(conn):
+                raise AssertionError("barcode lookups must not load the catalogue")
+
+            monkeypatch.setattr(search_cache, "fetch_catalogue", unexpected)
+            found = await search(
+                db, identity="12345678", city=["city"], brand=["BRAND"], chains="test"
+            )
+            assert found["total"] == 1
+            missing = await search(db, identity="12345678", city=["Other"])
+            assert missing["total"] == 0
+
+    asyncio.run(run())

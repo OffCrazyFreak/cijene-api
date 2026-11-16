@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -17,40 +18,47 @@ ORDERING_ENTRIES = 64
 ORDERING_KEYS = 500_000
 
 
+FacetValues = dict[str, dict[str, list[str]]]
+
+
+def group_facet_values(raw_values: dict[str, Iterable[str | None]]) -> FacetValues:
+    """Raw values behind each normalized filter value, per facet."""
+    facet_values: FacetValues = {}
+    for facet, values in raw_values.items():
+        grouped: dict[str, set[str]] = defaultdict(set)
+        for value in values:
+            if value:
+                grouped[normalize(value)].add(value)
+        facet_values[facet] = {key: sorted(raw) for key, raw in grouped.items()}
+    return facet_values
+
+
+def resolve_filter(values: dict[str, list[str]], wanted: set[str]) -> list[str]:
+    return sorted(raw for key in wanted for raw in values.get(key, ()))
+
+
 @dataclass(frozen=True)
 class Catalogue:
-    """Vocabulary plus the raw facet values behind each normalized filter value."""
-
     vocabulary: VocabularyIndex
-    facet_values: dict[str, dict[str, list[str]]]
+    facet_values: FacetValues
 
     @classmethod
     def build(
         cls, chain_products: list[Any], chains: list[str], cities: list[str]
     ) -> "Catalogue":
-        raw_values = {
-            "chain": chains,
-            "city": cities,
-            "brand": [row["brand"] for row in chain_products],
-            "category": [row["category"] for row in chain_products],
-        }
-        facet_values: dict[str, dict[str, list[str]]] = {}
-        for facet, values in raw_values.items():
-            grouped: dict[str, set[str]] = defaultdict(set)
-            for value in values:
-                if value:
-                    grouped[normalize(value)].add(value)
-            facet_values[facet] = {key: sorted(raw) for key, raw in grouped.items()}
-
+        facet_values = group_facet_values(
+            {
+                "chain": chains,
+                "city": cities,
+                "brand": (row["brand"] for row in chain_products),
+                "category": (row["category"] for row in chain_products),
+            }
+        )
         vocabulary = VocabularyIndex(
             (row["id"], row["name"], row["brand"], row["quantity"], row["unit"])
             for row in chain_products
         )
         return cls(vocabulary, facet_values)
-
-    def resolve(self, facet: str, wanted: set[str]) -> list[str]:
-        values = self.facet_values[facet]
-        return sorted(raw for key in wanted for raw in values.get(key, ()))
 
 
 async def fetch_catalogue(conn: Any) -> tuple[list[Any], list[str], list[str]]:
