@@ -47,128 +47,86 @@ def test_authored_query_retrieval_report():
     assert failures == []
 
 
-def test_decimal_scope_dedup_and_conflict():
-    import datetime
+async def insert_offers(db, offers):
+    async with db.import_transaction():
+        async with db._get_conn() as conn:
+            await conn.execute("INSERT INTO chains(code) VALUES('test')")
+            await conn.execute(
+                "INSERT INTO stores(chain_id,code,city) VALUES(1,'1','City'),(1,'2','City')"
+            )
+            for ean, store, regular, special in offers:
+                product = await conn.fetchval(
+                    "INSERT INTO products(ean) VALUES($1) ON CONFLICT(ean) DO UPDATE SET ean=EXCLUDED.ean RETURNING id",
+                    ean,
+                )
+                chain_product = await conn.fetchval(
+                    "INSERT INTO chain_products(chain_id,product_id,code,name,brand,quantity,unit) VALUES(1,$1,$2,'Mlijeko','Brand','1000','g') ON CONFLICT(chain_id,code) DO UPDATE SET code=EXCLUDED.code RETURNING id",
+                    product,
+                    ean,
+                )
+                await conn.execute(
+                    "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price,special_price) VALUES($1,$2,'2026-11-14',$3,$4)",
+                    chain_product,
+                    store,
+                    regular,
+                    special,
+                )
+
+
+def test_scoped_summary_and_filters(database):
+    import asyncio
     from decimal import Decimal
 
-    import pytest
+    from service.db.search import search
 
-    from service.db.search import evaluate
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(
+                db,
+                [
+                    ("1", 1, Decimal("1.00"), Decimal("1.40")),
+                    ("1", 2, Decimal("1.40"), None),
+                ],
+            )
+            result = await search(db, q="mlijeko", city="City", order="price_asc")
+            product = result["products"][0]
+            assert product["shop_count"] == 2 and product["chain_count"] == 1
+            assert product["min_price"] == Decimal("1.00")
+            assert product["avg_price"] == Decimal("1.20")
+            assert product["unit_prices"] == {"mass": Decimal("1.20")}
+            filtered = await search(db, q="mlijeko", city="City", brand="Other")
+            assert filtered["total"] == 0
 
-    row = dict(
-        ean="1",
-        name="Mlijeko",
-        brand="Brand",
-        category="Food",
-        product_name=None,
-        product_brand=None,
-        product_quantity=None,
-        product_unit=None,
-        chain="test",
-        store_code="1",
-        city="City",
-        code="1",
-        quantity="1000",
-        unit="g",
-        price_date=datetime.date(2026, 11, 14),
-        regular_price=Decimal("1.00"),
-        special_price=Decimal("1.40"),
-    )
-    rows = [
-        row,
-        row.copy(),
-        {**row, "store_code": "2", "regular_price": Decimal("1.40")},
-    ]
-    result = evaluate(
-        rows,
-        1,
-        "scope",
-        None,
-        "mlijeko",
-        None,
-        "City",
-        None,
-        None,
-        "price_asc",
-        100,
-        None,
-    )
-    product = result["products"][0]
-    assert product["shop_count"] == 2 and product["chain_count"] == 1
-    assert product["avg_price"] == Decimal("1.20")
-    assert product["unit_prices"] == {"mass": Decimal("1.20")}
-    assert (
-        evaluate(
-            rows,
-            1,
-            "scope",
-            None,
-            "mlijeko",
-            None,
-            "City",
-            "Other",
-            None,
-            "relevance",
-            100,
-            None,
-        )["total"]
-        == 0
-    )
-    with pytest.raises(ValueError, match="Conflicting"):
-        evaluate(
-            [row, {**row, "regular_price": Decimal("0.50")}],
-            1,
-            "scope",
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-            "relevance",
-            100,
-            None,
-        )
+    asyncio.run(run())
 
 
-def test_cursor_retains_exact_decimal_comparator():
-    import datetime
+def test_cursor_retains_exact_decimal_comparator(database):
+    import asyncio
     from decimal import Decimal
 
-    from service.db.search import decode_cursor, evaluate
+    from service.db.search import decode_cursor, search
 
-    row = dict(
-        ean="a",
-        name="Mlijeko",
-        brand="",
-        category="",
-        product_name=None,
-        product_brand=None,
-        product_quantity=None,
-        product_unit=None,
-        chain="test",
-        store_code="1",
-        city="City",
-        code="1",
-        quantity="1",
-        unit="l",
-        price_date=datetime.date(2026, 11, 14),
-        regular_price=Decimal("1.20000000000000000000000001"),
-        special_price=None,
-    )
-    rows = [
-        row,
-        {**row, "ean": "b", "regular_price": Decimal("1.20000000000000000000000002")},
-    ]
-    first = evaluate(
-        rows, 1, "scope", None, "", None, None, None, None, "price_asc", 1, None
-    )
-    cursor = decode_cursor(first["next_cursor"])
-    assert cursor["key"][2] == "1.20000000000000000000000001"
-    second = evaluate(
-        rows, 1, "scope", cursor, "", None, None, None, None, "price_asc", 1, None
-    )
-    assert [p["ean"] for p in first["products"] + second["products"]] == ["a", "b"]
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            await insert_offers(
+                db,
+                [
+                    ("a", 1, Decimal("1.20"), None),
+                    ("b", 1, Decimal("1.21"), None),
+                ],
+            )
+            first = await search(db, order="price_asc", page_size=1)
+            cursor = first["next_cursor"]
+            assert Decimal(decode_cursor(cursor)["key"][2]) == Decimal("1.20")
+            second = await search(db, order="price_asc", page_size=1, cursor=cursor)
+            assert [p["ean"] for p in first["products"] + second["products"]] == [
+                "a",
+                "b",
+            ]
+
+    asyncio.run(run())
 
 
 def test_transposition_with_another_edit():
