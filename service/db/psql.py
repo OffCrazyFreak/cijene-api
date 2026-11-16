@@ -50,12 +50,13 @@ async def _backfill_latest_offers(conn: asyncpg.Connection) -> None:
         return
 
     await conn.execute("LOCK TABLE prices IN SHARE ROW EXCLUSIVE MODE")
+    # Legacy imports stored a missing special price as 0, which would win every price sort.
     await conn.execute(
         """
         INSERT INTO latest_offers
         SELECT DISTINCT ON (chain_product_id, store_id)
-            chain_product_id, store_id, price_date, regular_price, special_price,
-            unit_price, best_price_30, anchor_price, available, anchor_price_date,
+            chain_product_id, store_id, price_date, regular_price,
+            NULLIF(special_price, 0), unit_price, best_price_30, anchor_price, available, anchor_price_date,
             special_sale_type
         FROM prices
         ORDER BY chain_product_id, store_id, price_date DESC

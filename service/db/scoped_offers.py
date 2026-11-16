@@ -100,7 +100,7 @@ def ordering_sql(
         matching AS MATERIALIZED (
             SELECT p.ean,c.code AS chain,s.code AS store_code,s.city,cp.brand,cp.category,
                    cp.id AS chain_product_id,o.price_date,
-                   least(o.regular_price,o.special_price) AS effective,candidates.rank
+                   least(o.regular_price,NULLIF(o.special_price,0)) AS effective,candidates.rank
             {LATEST_OFFERS}
             JOIN candidates ON candidates.product_id=p.id
             WHERE ({identity_param}::text IS NULL OR p.ean={identity_param})
@@ -134,7 +134,7 @@ def page_sql(statement: Statement, eans: list[str]) -> str:
                p.quantity AS product_quantity,p.unit AS product_unit,
                c.code AS chain,s.code AS store_code,s.city,
                cp.id AS chain_product_id,cp.code,cp.name,cp.brand,cp.category,cp.quantity,cp.unit,
-               o.price_date,least(o.regular_price,o.special_price) AS effective
+               o.price_date,least(o.regular_price,NULLIF(o.special_price,0)) AS effective
         {LATEST_OFFERS}
         WHERE p.ean=ANY({eans_param}::text[])
     ) offers"""

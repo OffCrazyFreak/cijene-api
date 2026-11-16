@@ -38,6 +38,12 @@ def test_legacy_backfill_repeat_and_cleanup(database, monkeypatch):
             assert await db._fetchval("SELECT epoch FROM import_state") == 1
             assert await db._fetchval("SELECT count(*) FROM users") == 1
             assert await db._fetchval("SELECT to_regclass('generations')") is None
+            from service.db.search import search
+
+            product = (await search(db, q="corrected", order="price_asc"))["products"][
+                0
+            ]
+            assert product["min_price"] == Decimal("2.00")
 
             await db.create_tables()
             assert await db._fetchval("SELECT epoch FROM import_state") == 1
@@ -136,7 +142,10 @@ def test_legacy_full_payload(database):
                 )
                 for offer, price in zip(latest, expected, strict=True):
                     for key in offer.keys():
-                        assert offer[key] == price[key], key
+                        if key == "special_price" and price[key] == 0:
+                            assert offer[key] is None
+                        else:
+                            assert offer[key] == price[key], key
 
     asyncio.run(run())
 
