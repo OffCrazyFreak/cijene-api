@@ -1,5 +1,6 @@
 import asyncio
 import shutil
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -81,16 +82,100 @@ def test_duplicate_permutations(database, tmp_path, conflict, reverse, alias):
                     rows.reverse()
 
             rewrite(day / "test" / "prices.csv", duplicate)
-            rejected = conflict and not alias
             with patch.object(importer, "db", db):
-                if rejected:
-                    with pytest.raises(ValueError):
-                        await importer.import_directory(day, False)
-                else:
-                    await importer.import_directory(day, False)
+                await importer.import_directory(day, False)
+            skipped = conflict and not alias
             assert await db._fetchval("SELECT count(*) FROM prices") == (
-                0 if rejected else 2 if alias else 1
+                2 if alias else 0 if skipped else 1
             )
+
+    asyncio.run(run())
+
+
+async def fetch_all(db, query):
+    async with db._get_conn() as conn:
+        return [tuple(row) for row in await conn.fetch(query)]
+
+
+def test_rows_differing_only_in_unit_price_merge(database, tmp_path):
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            day = write_day(tmp_path)
+
+            def unit_prices(rows):
+                first = dict(rows[0], unit_price="0.12")
+                rows[:] = [
+                    first,
+                    dict(first, unit_price="0.17"),
+                    dict(first, unit_price="0.18"),
+                ]
+                rows.append(dict(first, product_id="002", unit_price="0.50"))
+                rows.append(dict(first, product_id="002", unit_price="0.50"))
+
+            rewrite(
+                day / "test" / "products.csv",
+                lambda rows: rows.append(
+                    dict(rows[0], product_id="002", barcode="22345678")
+                ),
+            )
+            rewrite(day / "test" / "prices.csv", unit_prices)
+            with patch.object(importer, "db", db):
+                await importer.import_directory(day, False)
+            rows = await fetch_all(
+                db,
+                "SELECT cp.code,p.unit_price FROM prices p JOIN chain_products cp ON cp.id=p.chain_product_id ORDER BY cp.code",
+            )
+            assert rows == [("001", None), ("002", Decimal("0.50"))]
+
+    asyncio.run(run())
+
+
+def test_conflicting_rows_skip_only_that_shop_and_day(database, tmp_path, caplog):
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            older = write_day(tmp_path, "2.00").rename(tmp_path / "2026-11-13")
+            with patch.object(importer, "db", db):
+                await importer.import_directory(older, False)
+
+            day = write_day(tmp_path, "2.00")
+            rewrite(
+                day / "test" / "products.csv",
+                lambda rows: rows.append(
+                    dict(rows[0], product_id="002", barcode="22345678")
+                ),
+            )
+            rewrite(
+                day / "test" / "prices.csv",
+                lambda rows: rows.extend(
+                    [
+                        dict(rows[0], price="1.49"),
+                        dict(rows[0], product_id="002", price="3.00"),
+                    ]
+                ),
+            )
+            other = day / "other"
+            shutil.copytree(day / "test", other)
+            rewrite(
+                other / "prices.csv",
+                lambda rows: rows.append(
+                    dict(rows[2], special_price="0.40", price="3.00")
+                ),
+            )
+            with patch.object(importer, "db", db):
+                await importer.import_directory(day, False)
+
+            assert "other: skipped 2 product and shop pairs" in caplog.text
+            assert "test: skipped 1 product and shop pairs" in caplog.text
+            offers = await fetch_all(
+                db,
+                "SELECT c.code,cp.code,o.price_date::text,o.regular_price FROM latest_offers o JOIN chain_products cp ON cp.id=o.chain_product_id JOIN chains c ON c.id=cp.chain_id ORDER BY 1,2",
+            )
+            assert offers == [
+                ("test", "001", "2026-11-13", Decimal("2.00")),
+                ("test", "002", "2026-11-14", Decimal("3.00")),
+            ]
 
     asyncio.run(run())
 

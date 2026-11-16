@@ -2,6 +2,7 @@
 
 import csv
 import json
+import logging
 import re
 import sqlite3
 from contextlib import closing
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Iterator
 
 from common.barcodes import normalize_barcode
+
+logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 2 * 1024**3
 MAX_INPUT_BYTES = 8 * 1024**3
@@ -122,8 +125,60 @@ def remember(index: sqlite3.Connection, kind: str, key: str, row: dict) -> bool:
         if previous[0] != payload:
             raise ValueError("Conflicting duplicate source row")
         return False
-    index.execute("INSERT INTO entries VALUES (?,?,?)", (kind, key, payload))
+    index.execute(
+        "INSERT INTO entries(kind,key,payload) VALUES (?,?,?)", (kind, key, payload)
+    )
     return True
+
+
+def merge_offer(kept: dict, row: dict) -> dict | None:
+    """One offer from rows that differ at most in unit price, or None to skip."""
+    if {k: v for k, v in kept.items() if k != "unit_price"} != {
+        k: v for k, v in row.items() if k != "unit_price"
+    }:
+        return None
+    if kept.get("unit_price", "") != row.get("unit_price", ""):
+        return {**kept, "unit_price": ""}
+    return kept
+
+
+def remember_offer(index: sqlite3.Connection, key: str, row: dict) -> None:
+    previous = index.execute(
+        "SELECT payload,skipped FROM entries WHERE kind='prices' AND key=?", (key,)
+    ).fetchone()
+    if previous is None:
+        remember(index, "prices", key, row)
+        return
+
+    payload, skipped = previous
+    if skipped:
+        return
+    merged = merge_offer(json.loads(payload), row)
+    if merged is None:
+        index.execute(
+            "UPDATE entries SET skipped=1 WHERE kind='prices' AND key=?", (key,)
+        )
+    else:
+        index.execute(
+            "UPDATE entries SET payload=? WHERE kind='prices' AND key=?",
+            (json.dumps(merged, sort_keys=True), key),
+        )
+
+
+def write_offers(index: sqlite3.Connection, writer: csv.DictWriter, chain: str) -> None:
+    for (payload,) in index.execute(
+        "SELECT payload FROM entries WHERE kind='prices' AND NOT skipped ORDER BY rowid"
+    ):
+        writer.writerow(json.loads(payload))
+
+    skipped = index.execute(
+        "SELECT count(*) FROM entries WHERE kind='prices' AND skipped"
+    ).fetchone()[0]
+    if skipped:
+        logger.warning(
+            f"{chain}: skipped {skipped:,} product and shop pairs whose rows "
+            "for one date conflict"
+        )
 
 
 def prepare_input(path: Path, destination: Path) -> None:
@@ -141,7 +196,8 @@ def prepare_input(path: Path, destination: Path) -> None:
     total = 0
     with closing(sqlite3.connect(destination / "validation.sqlite")) as index, index:
         index.execute(
-            "CREATE TABLE entries (kind TEXT, key TEXT, payload TEXT, PRIMARY KEY(kind,key))"
+            "CREATE TABLE entries (kind TEXT, key TEXT, payload TEXT, "
+            "skipped INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(kind,key))"
         )
         for chain in chains:
             if chain.is_symlink() or not chain.is_dir() or len(chain.name) > 50:
@@ -218,10 +274,16 @@ def prepare_input(path: Path, destination: Path) -> None:
                             for field, limit in limits.items()
                         ):
                             raise ValueError("Missing identity or oversized metadata")
+                        # Owner rule: rows of one code, shop and date differing beyond unit price are skipped.
+                        if kind == "prices":
+                            remember_offer(index, key, row)
+                            continue
                         # Two product codes of one barcode in a shop are kept; reads pick one.
                         if not remember(index, kind, key, row):
                             continue
                         writer.writerow(row)
+                    if kind == "prices" and writer is not None:
+                        write_offers(index, writer, chain.name)
                     if writer is None:
                         with source.open(encoding="utf-8", newline="") as original:
                             headers = next(csv.reader(original))
