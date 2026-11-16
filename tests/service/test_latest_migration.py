@@ -250,3 +250,21 @@ def test_served_tables_have_no_row_copying_triggers(database):
             assert triggers == 0
 
     asyncio.run(run())
+
+
+def test_unchanged_metadata_updates_keep_the_epoch(database):
+    from service.db.models import Product
+
+    async def run():
+        async with database() as db:
+            await legacy(db)
+            await db.create_tables()
+            await db.update_store(1, "old", city="City")
+            await db.update_product(Product(ean="123", name="Renamed"))
+            before = await db._fetchval("SELECT epoch FROM import_state")
+
+            assert await db.update_store(1, "old", city="City") is True
+            assert await db.update_product(Product(ean="123", name="Renamed")) is False
+            assert await db._fetchval("SELECT epoch FROM import_state") == before
+
+    asyncio.run(run())

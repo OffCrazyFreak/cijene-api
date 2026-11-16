@@ -443,20 +443,34 @@ class PostgresDatabase(Database):
     ) -> bool:
         """
         Update store information by chain_id and store code.
-        Returns True if the store was updated, False if not found.
+        Returns True if the store exists, False if not found.
         """
         async with self._metadata_connection() as conn:
-            result = await conn.execute(
+            counts = await conn.fetchrow(
                 """
-                UPDATE stores
-                SET
-                    address = COALESCE($3, stores.address),
-                    city = COALESCE($4, stores.city),
-                    zipcode = COALESCE($5, stores.zipcode),
-                    lat = COALESCE($6, stores.lat),
-                    lon = COALESCE($7, stores.lon),
-                    phone = COALESCE($8, stores.phone)
-                WHERE chain_id = $1 AND code = $2
+                WITH target AS (
+                    SELECT id FROM stores WHERE chain_id = $1 AND code = $2
+                ), changed AS (
+                    UPDATE stores
+                    SET
+                        address = COALESCE($3, stores.address),
+                        city = COALESCE($4, stores.city),
+                        zipcode = COALESCE($5, stores.zipcode),
+                        lat = COALESCE($6, stores.lat),
+                        lon = COALESCE($7, stores.lon),
+                        phone = COALESCE($8, stores.phone)
+                    WHERE id IN (SELECT id FROM target)
+                        AND (address, city, zipcode, lat, lon, phone) IS DISTINCT FROM (
+                            COALESCE($3, stores.address),
+                            COALESCE($4, stores.city),
+                            COALESCE($5, stores.zipcode),
+                            COALESCE($6, stores.lat),
+                            COALESCE($7, stores.lon),
+                            COALESCE($8, stores.phone)
+                        )
+                    RETURNING id
+                )
+                SELECT (SELECT count(*) FROM target), (SELECT count(*) FROM changed)
                 """,
                 chain_id,
                 store_code,
@@ -467,8 +481,12 @@ class PostgresDatabase(Database):
                 lon or None,
                 phone or None,
             )
-            await self._note_change(conn, "stores", _affected_rows(result))
-            return _affected_rows(result) == 1
+            if counts is None:
+                raise RuntimeError("Store update returned no counts")
+
+            found, changed = counts
+            await self._note_change(conn, "stores", changed)
+            return found == 1
 
     async def list_stores(self, chain_code: str) -> list[StoreWithId]:
         async with self._get_conn() as conn:
@@ -681,6 +699,12 @@ class PostgresDatabase(Database):
                     quantity = COALESCE($4, products.quantity),
                     unit = COALESCE($5, products.unit)
                 WHERE ean = $1
+                    AND (brand, name, quantity, unit) IS DISTINCT FROM (
+                        COALESCE($2, products.brand),
+                        COALESCE($3, products.name),
+                        COALESCE($4, products.quantity),
+                        COALESCE($5, products.unit)
+                    )
                 """,
                 product.ean,
                 product.brand,

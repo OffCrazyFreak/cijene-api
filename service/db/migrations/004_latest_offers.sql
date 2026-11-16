@@ -50,7 +50,17 @@ CREATE TABLE IF NOT EXISTS import_state (
 );
 
 INSERT INTO import_state (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
-ALTER TABLE import_state DROP COLUMN IF EXISTS epoch_transaction;
+-- Guarded so a startup rerun takes no ACCESS EXCLUSIVE lock on tables that readers use.
+DO $column$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'import_state' AND column_name = 'epoch_transaction'
+    ) THEN
+        ALTER TABLE import_state DROP COLUMN epoch_transaction;
+    END IF;
+END
+$column$;
 
 -- The importer and metadata writers move the epoch themselves once per changing transaction.
 -- Row-copying statement triggers kept every batch in memory until a whole-archive import committed.
@@ -65,11 +75,16 @@ $$;
 DO $triggers$
 DECLARE
     served TEXT;
+    old_trigger NAME;
 BEGIN
     FOREACH served IN ARRAY ARRAY['chains', 'stores', 'products', 'chain_products', 'latest_offers', 'chain_import_dates'] LOOP
-        EXECUTE format('DROP TRIGGER IF EXISTS epoch_after_insert ON %I', served);
-        EXECUTE format('DROP TRIGGER IF EXISTS epoch_after_update ON %I', served);
-        EXECUTE format('DROP TRIGGER IF EXISTS epoch_after_delete ON %I', served);
+        FOR old_trigger IN
+            SELECT tgname FROM pg_trigger
+            WHERE tgrelid = served::regclass
+                AND tgname IN ('epoch_after_insert', 'epoch_after_update', 'epoch_after_delete')
+        LOOP
+            EXECUTE format('DROP TRIGGER %I ON %I', old_trigger, served);
+        END LOOP;
         EXECUTE format(
             'CREATE OR REPLACE TRIGGER epoch_after_truncate AFTER TRUNCATE ON %I '
             'FOR EACH STATEMENT EXECUTE FUNCTION bump_import_epoch_on_truncate()',
