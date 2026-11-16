@@ -90,6 +90,36 @@ def test_older_import_preserves_latest_and_missing_branch(database, tmp_path):
     asyncio.run(run())
 
 
+def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path, caplog):
+    from decimal import Decimal
+
+    from service.db.search import latest_prices, search
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            with patch.object(importer, "db", db):
+                await importer.import_directory(write_day(tmp_path), False)
+            async with db.import_transaction():
+                alias = await db._fetchval(
+                    "INSERT INTO chain_products(chain_id,product_id,code,name,unit,quantity) SELECT chain_id,product_id,'alias',name,unit,quantity FROM chain_products RETURNING id"
+                )
+                await db._fetchval(
+                    "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price) VALUES($1,1,'2026-11-15',1) RETURNING store_id",
+                    alias,
+                )
+            assert "1 shops list one barcode under several chain codes" in caplog.text
+
+            product = (await search(db, q="original"))["products"][0]
+            assert product["shop_count"] == 1
+            assert product["min_price"] == Decimal("1.00")
+            ean = await db._fetchval("SELECT ean FROM products")
+            prices = await latest_prices(db, {ean}, lambda stores: stores)
+            assert [row["regular_price"] for row in prices] == [Decimal("1.00")]
+
+    asyncio.run(run())
+
+
 def test_metadata_source_date_without_new_offer(database, tmp_path):
     import shutil
     from tests.service.import_fixtures import rewrite

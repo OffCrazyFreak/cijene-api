@@ -354,6 +354,15 @@ async def directory(database: Any, kind: str) -> list[dict[str, Any]]:
         return [dict(row) for row in await conn.fetch(query)]
 
 
+def canonical_offer_order(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row["chain"],
+        row["store_code"],
+        -row["price_date"].toordinal(),
+        row["chain_product_id"],
+    )
+
+
 async def latest_prices(
     database: Any, eans: set[str], store_filter: Any
 ) -> list[dict[str, Any]]:
@@ -372,9 +381,7 @@ async def latest_prices(
                 )
             ]
             shops = {}
-            for row in sorted(
-                rows, key=lambda row: (row["chain"], row["code"], row["store_code"])
-            ):
+            for row in sorted(rows, key=canonical_offer_order):
                 shops.setdefault((row["ean"], row["chain"], row["store_code"]), row)
             return list(shops.values())
 
@@ -489,7 +496,7 @@ async def serving_search(
         accepted
         + ", eligible AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM matching WHERE "
         + " AND ".join(clauses.values())
-        + " ORDER BY ean,chain,store_code,code), priced AS (SELECT *,least(regular_price,special_price) effective FROM eligible) "
+        + " ORDER BY ean,chain,store_code,price_date DESC,chain_product_id), priced AS (SELECT *,least(regular_price,special_price) effective FROM eligible) "
     )
     aggregate = """ min(effective) min_price,max(effective) max_price,avg(effective) avg_price,
         count(*) shop_count,count(DISTINCT chain) chain_count,
@@ -620,7 +627,7 @@ async def chain_statistics(database: Any) -> list[Any]:
         rows = await conn.fetch(
             "WITH offers AS ("
             + SQL
-            + "), shops AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM offers ORDER BY ean,chain,store_code,code) SELECT chain,max(price_date) price_date,count(*) price_count,count(DISTINCT store_code) store_count FROM shops GROUP BY chain ORDER BY chain"
+            + "), shops AS (SELECT DISTINCT ON(ean,chain,store_code) * FROM offers ORDER BY ean,chain,store_code,price_date DESC,chain_product_id) SELECT chain,max(price_date) price_date,count(*) price_count,count(DISTINCT store_code) store_count FROM shops GROUP BY chain ORDER BY chain"
         )
 
     return rows
