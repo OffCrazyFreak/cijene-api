@@ -1,4 +1,4 @@
-from service.db.search import relevance, normalize
+from service.db.matching import relevance, normalize
 
 
 def test_matching():
@@ -172,7 +172,7 @@ def test_cursor_retains_exact_decimal_comparator():
 
 
 def test_transposition_with_another_edit():
-    from service.db.search import token_distance
+    from service.db.matching import token_distance
 
     assert token_distance("ockolada", "cokolade") == 2
     assert token_distance("abcd", "badc") == 2
@@ -180,13 +180,13 @@ def test_transposition_with_another_edit():
 
 
 def test_impossible_lengths_skip_distance_matrix(monkeypatch):
-    from service.db import search
+    from service.db import matching
 
     def unexpected(*args, **kwargs):
         raise AssertionError("Impossible edit distance should be rejected first")
 
-    monkeypatch.setattr(search, "token_distance", unexpected)
-    assert search.relevance("x" * 200, "Mlijeko", "") is None
+    monkeypatch.setattr(matching, "token_distance", unexpected)
+    assert matching.relevance("x" * 200, "Mlijeko", "") is None
 
 
 def test_long_query_rejected_before_database_access():
