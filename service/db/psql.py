@@ -309,29 +309,23 @@ class PostgresDatabase(Database):
 
     async def add_store(self, store: Store) -> int:
         # Skipping unchanged rows keeps an identical replay from expiring cursors.
-        return await self._fetchval(
+        store_id = await self._fetchval(
             """
-            WITH upserted AS (
-                INSERT INTO stores (chain_id, code, type, address, city, zipcode)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (chain_id, code) DO UPDATE SET
-                    type = COALESCE($3, stores.type),
-                    address = COALESCE($4, stores.address),
-                    city = COALESCE($5, stores.city),
-                    zipcode = COALESCE($6, stores.zipcode)
-                WHERE (stores.type, stores.address, stores.city, stores.zipcode)
-                    IS DISTINCT FROM (
-                        COALESCE($3, stores.type),
-                        COALESCE($4, stores.address),
-                        COALESCE($5, stores.city),
-                        COALESCE($6, stores.zipcode)
-                    )
-                RETURNING id
-            )
-            SELECT id FROM upserted
-            UNION ALL
-            SELECT id FROM stores WHERE chain_id = $1 AND code = $2
-            LIMIT 1
+            INSERT INTO stores (chain_id, code, type, address, city, zipcode)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (chain_id, code) DO UPDATE SET
+                type = COALESCE($3, stores.type),
+                address = COALESCE($4, stores.address),
+                city = COALESCE($5, stores.city),
+                zipcode = COALESCE($6, stores.zipcode)
+            WHERE (stores.type, stores.address, stores.city, stores.zipcode)
+                IS DISTINCT FROM (
+                    COALESCE($3, stores.type),
+                    COALESCE($4, stores.address),
+                    COALESCE($5, stores.city),
+                    COALESCE($6, stores.zipcode)
+                )
+            RETURNING id
             """,
             store.chain_id,
             store.code,
@@ -339,6 +333,15 @@ class PostgresDatabase(Database):
             store.address or None,
             store.city or None,
             store.zipcode or None,
+        )
+        if store_id is not None:
+            return store_id
+
+        # A separate statement sees a row that a concurrent writer committed meanwhile.
+        return await self._fetchval(
+            "SELECT id FROM stores WHERE chain_id = $1 AND code = $2",
+            store.chain_id,
+            store.code,
         )
 
     @asynccontextmanager
