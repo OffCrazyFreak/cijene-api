@@ -12,6 +12,7 @@ from service.db.models import ChainStats, StorePrice
 from service.db.search import (
     MAX_QUERY_LENGTH,
     CursorExpired,
+    SearchTimeout,
     directory,
     latest_prices,
     normalize,
@@ -271,6 +272,8 @@ async def get_product(
         result = await search(
             db, identity=ean, chains=chains, city=city, brand=brand, category=category
         )
+    except SearchTimeout as exc:
+        raise HTTPException(503, "search_timeout") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not result["products"]:
@@ -418,6 +421,8 @@ async def search_products(
         return jsonable_encoder(result, custom_encoder={Decimal: str})
     except CursorExpired as exc:
         raise HTTPException(409, "cursor_expired") from exc
+    except SearchTimeout as exc:
+        raise HTTPException(503, "search_timeout") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

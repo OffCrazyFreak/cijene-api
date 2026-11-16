@@ -255,3 +255,68 @@ def test_later_pages_reuse_the_cached_ordering(database):
             assert third["products"][0]["ean"] == "c" and third["next_cursor"] is None
 
     asyncio.run(run())
+
+
+def test_time_budget_and_statement_timeout_return_503(
+    database, service_client, monkeypatch
+):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from decimal import Decimal
+
+    from service.db import search as searching
+
+    async def run():
+        async with database() as db:
+            async with service_client(db) as client:
+                await db._fetchval(
+                    "INSERT INTO users(name,api_key) VALUES('slow','slow-fixture') RETURNING id"
+                )
+                await insert_offers(db, [("a", 1, Decimal("1.00"), None)])
+                original = db._get_conn
+
+                class Slow:
+                    def __init__(self, conn):
+                        self.conn = conn
+
+                    def __getattr__(self, name):
+                        return getattr(self.conn, name)
+
+                    async def fetchrow(self, query, *args):
+                        await self.conn.execute("SELECT pg_sleep(2)")
+                        return await self.conn.fetchrow(query, *args)
+
+                @asynccontextmanager
+                async def slow():
+                    async with original() as conn:
+                        yield Slow(conn)
+
+                async def status(**budget):
+                    with monkeypatch.context() as changes:
+                        for name, value in budget.items():
+                            changes.setattr(searching, name, value)
+                        with patch.object(db, "_get_conn", slow):
+                            response = await client.get(
+                                "/v1/products/",
+                                params={"q": "mlijeko"},
+                                headers={"Authorization": "Bearer slow-fixture"},
+                            )
+                    return response.status_code, response.json()
+
+                assert await status(SEARCH_STATEMENT_TIMEOUT="50ms") == (
+                    503,
+                    {"detail": "search_timeout"},
+                )
+                assert await status(SEARCH_BUDGET_SECONDS=0.2) == (
+                    503,
+                    {"detail": "search_timeout"},
+                )
+                with patch.object(db, "_get_conn", original):
+                    response = await client.get(
+                        "/v1/products/",
+                        params={"q": "mlijeko"},
+                        headers={"Authorization": "Bearer slow-fixture"},
+                    )
+                assert response.status_code == 200
+
+    asyncio.run(run())

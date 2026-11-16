@@ -5,9 +5,12 @@ import base64
 import hashlib
 import json
 from bisect import bisect_right
+from dataclasses import dataclass
 from collections.abc import Iterable
 from decimal import Decimal
 from typing import Any
+
+from asyncpg.exceptions import QueryCanceledError
 
 from common.barcodes import normalize_barcode
 from service.db.matching import normalize
@@ -20,6 +23,8 @@ from service.db.scoped_offers import (
 from service.db.search_cache import Catalogue, Ordering, SortKey, search_cache
 
 MAX_QUERY_LENGTH = 256
+SEARCH_STATEMENT_TIMEOUT = "10s"
+SEARCH_BUDGET_SECONDS = 15
 PRICE_COLUMNS = """
     p.ean,c.id AS chain_id,c.code AS chain,s.code AS store_code,
     s.city,s.address,s.lat,s.lon,s.type,s.zipcode,s.phone,
@@ -31,6 +36,10 @@ PRICE_COLUMNS = """
 
 class CursorExpired(Exception):
     """The data changed since the cursor was issued; the client restarts."""
+
+
+class SearchTimeout(Exception):
+    """The search ran past its time budget."""
 
 
 def selection(value: str | None) -> set[str]:
@@ -157,42 +166,70 @@ async def search(
     decoded = decode_cursor(cursor) if cursor else None
     if decoded and decoded["scope"] != scope:
         raise ValueError("Cursor scope or order changed")
-    boundary = cursor_boundary(decoded["key"]) if decoded else None
 
+    request = ScopeRequest(
+        q=q,
+        wanted=wanted,
+        identity=normalize_barcode(identity) or identity if identity else None,
+        city_labels=city_labels or {},
+        order=order,
+        page_size=page_size,
+        scope=scope,
+        cursor_epoch=decoded["epoch"] if decoded else None,
+        boundary=cursor_boundary(decoded["key"]) if decoded else None,
+    )
+    try:
+        async with asyncio.timeout(SEARCH_BUDGET_SECONDS):
+            return await search_snapshot(database, request)
+    except (TimeoutError, QueryCanceledError) as exc:
+        raise SearchTimeout from exc
+
+
+@dataclass(frozen=True)
+class ScopeRequest:
+    q: str
+    wanted: dict[str, set[str]]
+    identity: str | None
+    city_labels: dict[str, str]
+    order: str
+    page_size: int
+    scope: str
+    cursor_epoch: int | None
+    boundary: SortKey | None
+
+
+async def search_snapshot(database: Any, request: ScopeRequest) -> dict[str, Any]:
     async with database._get_conn() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
+            await conn.execute(
+                f"SET LOCAL statement_timeout = '{SEARCH_STATEMENT_TIMEOUT}'"
+            )
             epoch = await conn.fetchval("SELECT epoch FROM import_state")
-            if decoded and decoded["epoch"] != epoch:
+            if request.cursor_epoch is not None and request.cursor_epoch != epoch:
                 raise CursorExpired
 
             cache = search_cache(database)
             catalogue = (
                 await cache.catalogue(epoch, conn)
-                if normalize(q) or any(wanted.values())
+                if normalize(request.q) or any(request.wanted.values())
                 else None
             )
             filters = {
                 facet: catalogue.resolve(facet, values)
                 if catalogue and values
                 else None
-                for facet, values in wanted.items()
+                for facet, values in request.wanted.items()
             }
 
-            ordering = cache.ordering(epoch, scope)
+            ordering = cache.ordering(epoch, request.scope)
             if ordering is None:
-                ordering = await scope_ordering(
-                    conn,
-                    catalogue,
-                    q,
-                    filters,
-                    normalize_barcode(identity) or identity if identity else None,
-                    city_labels or {},
-                    order,
-                )
-                cache.remember(epoch, scope, ordering)
+                ordering = await scope_ordering(conn, catalogue, filters, request)
+                cache.remember(epoch, request.scope, ordering)
 
-            start = bisect_right(ordering.keys, boundary) if boundary else 0
-            page = ordering.keys[start : start + page_size]
+            start = (
+                bisect_right(ordering.keys, request.boundary) if request.boundary else 0
+            )
+            page = ordering.keys[start : start + request.page_size]
             products = await page_products(conn, filters, [key[5] for key in page])
 
     has_more = start + len(page) < len(ordering.keys)
@@ -200,7 +237,7 @@ async def search(
         products=products,
         generation=epoch,
         total=len(ordering.keys),
-        next_cursor=encode_cursor(epoch, scope, cursor_key(page[-1]))
+        next_cursor=encode_cursor(epoch, request.scope, cursor_key(page[-1]))
         if has_more
         else None,
         facets=ordering.facets,
@@ -210,22 +247,29 @@ async def search(
     )
 
 
+def price_key(order: str, min_price: Decimal) -> Decimal:
+    if order == "price_asc":
+        return min_price
+    if order == "price_desc":
+        return -min_price
+    return Decimal(0)
+
+
 async def scope_ordering(
     conn: Any,
     catalogue: Catalogue | None,
-    q: str,
     filters: dict[str, list[str] | None],
-    identity: str | None,
-    city_labels: dict[str, str],
-    order: str,
+    request: ScopeRequest,
 ) -> Ordering:
     matched = (
-        await asyncio.to_thread(catalogue.vocabulary.match, q)
-        if catalogue and normalize(q)
+        await asyncio.to_thread(catalogue.vocabulary.match, request.q)
+        if catalogue and normalize(request.q)
         else None
     )
     statement = Statement(filters)
-    sql = ordering_sql(statement, identity, matched, city_labels, order)
+    sql = ordering_sql(
+        statement, request.identity, matched, request.city_labels, request.order
+    )
     row = await conn.fetchrow(sql, *statement.args)
 
     keys: list[SortKey] = []
@@ -237,7 +281,7 @@ async def scope_ordering(
         row["chain_count"],
         strict=True,
     ):
-        price = {"relevance": Decimal(0), "price_asc": min_price}.get(order, -min_price)
+        price = price_key(request.order, min_price)
         keys.append((rank // 10, rank % 10, price, -shops, -chains, ean))
 
     facets = {facet: json.loads(row[facet]) for facet in filters}
