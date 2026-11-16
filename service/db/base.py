@@ -27,7 +27,7 @@ class Database(ABC):
     async def record_metadata_source_date(
         self, table: str, ids: list[int], source: date
     ) -> None:
-        raise NotImplementedError("Metadata provenance requires publication support")
+        raise NotImplementedError("Metadata provenance requires import transactions")
 
     @abstractmethod
     async def connect(self) -> None:
