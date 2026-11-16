@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.service.async_helpers import wait_for_event
+
 
 async def legacy(db):
     async with db._get_conn() as conn:
@@ -168,7 +170,7 @@ def test_cancelled_backfill_rolls_back(database, monkeypatch):
             with monkeypatch.context() as changes:
                 changes.setattr(psql, "_backfill_latest_offers", paused)
                 task = asyncio.create_task(db.create_tables())
-                await reached.wait()
+                await wait_for_event(reached, task)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
