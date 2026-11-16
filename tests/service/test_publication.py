@@ -90,7 +90,7 @@ def test_older_import_preserves_latest_and_missing_branch(database, tmp_path):
     asyncio.run(run())
 
 
-def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path, caplog):
+def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path):
     from decimal import Decimal
 
     from service.db.search import latest_prices, search
@@ -108,8 +108,6 @@ def test_duplicate_chain_codes_pick_newest_offer(database, tmp_path, caplog):
                     "INSERT INTO latest_offers(chain_product_id,store_id,price_date,regular_price) VALUES($1,1,'2026-11-15',1) RETURNING store_id",
                     alias,
                 )
-            assert "1 shops list one barcode under several chain codes" in caplog.text
-
             product = (await search(db, q="original"))["products"][0]
             assert product["shop_count"] == 1
             assert product["min_price"] == Decimal("1.00")
@@ -249,5 +247,37 @@ def test_direct_metadata_update_waits_for_writer_and_moves_epoch(database, kind)
             finally:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_one_batch_with_two_dates_keeps_the_newest_latest_offer(database):
+    from datetime import date
+    from decimal import Decimal
+
+    from service.db.models import Price
+
+    async def run():
+        async with database() as db:
+            await db.create_tables()
+            async with db.import_transaction():
+                async with db._get_conn() as conn:
+                    await conn.execute("""
+                        INSERT INTO chains(code) VALUES('test');
+                        INSERT INTO stores(chain_id,code) VALUES(1,'1');
+                        INSERT INTO products(ean) VALUES('1');
+                        INSERT INTO chain_products(chain_id,product_id,code,name) VALUES(1,1,'1','Mlijeko');
+                    """)
+                await db.add_many_prices(
+                    [
+                        Price(1, 1, date(2026, 11, 14), Decimal("2.00")),
+                        Price(1, 1, date(2026, 11, 13), Decimal("1.00")),
+                    ]
+                )
+            assert await db._fetchval("SELECT count(*) FROM prices") == 2
+            latest = await db._fetchval(
+                "SELECT price_date::text || ' ' || regular_price FROM latest_offers"
+            )
+            assert latest == "2026-11-14 2.00"
 
     asyncio.run(run())

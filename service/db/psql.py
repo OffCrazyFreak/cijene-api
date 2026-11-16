@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -35,21 +35,12 @@ from .models import (
 
 
 DUPLICATE_CANONICAL_OFFERS = """
-    WITH aliases AS (
-        SELECT id, product_id FROM chain_products
-        WHERE (chain_id, product_id) IN (
-            SELECT chain_id, product_id FROM chain_products
-            WHERE product_id IS NOT NULL
-            GROUP BY chain_id, product_id
-            HAVING count(*) > 1
-        )
-    )
-    SELECT count(*) FROM (
-        SELECT 1 FROM latest_offers o
-        JOIN aliases a ON a.id = o.chain_product_id
-        GROUP BY a.product_id, o.store_id
-        HAVING count(*) > 1
-    ) duplicates
+    SELECT DISTINCT cp.product_id, t.store_id
+    FROM temp_prices t
+    JOIN chain_products cp ON cp.id = t.chain_product_id
+    JOIN chain_products other ON other.product_id = cp.product_id
+        AND other.chain_id = cp.chain_id AND other.id <> cp.id
+    JOIN latest_offers o ON o.chain_product_id = other.id AND o.store_id = t.store_id
 """
 
 
@@ -89,6 +80,7 @@ class _TransactionContext:
     owner: asyncio.Task | None
     connection: asyncpg.Connection
     mode: str
+    duplicate_shops: set[tuple[int, int]] = field(default_factory=set)
 
 
 class PostgresDatabase(Database):
@@ -206,12 +198,16 @@ class PostgresDatabase(Database):
                         + " WHERE id=$1",
                         [tuple(record) for record in records],
                     )
-            duplicates = await conn.fetchval(DUPLICATE_CANONICAL_OFFERS)
-            if duplicates:
-                self.logger.warning(
-                    f"{duplicates:,} shops list one barcode under several chain "
-                    "codes; reads use the newest offer"
-                )
+            context = self._import_conn.get()
+            if context is not None:
+                self._warn_duplicate_shops(context.duplicate_shops)
+
+    def _warn_duplicate_shops(self, shops: set[tuple[int, int]]) -> None:
+        if shops:
+            self.logger.warning(
+                f"{len(shops):,} shops list one barcode under several chain "
+                "codes; reads use the newest offer"
+            )
 
     async def record_metadata_source_date(
         self, table: str, ids: list[int], source: date
@@ -879,7 +875,9 @@ class PostgresDatabase(Database):
             )
             await conn.execute(
                 """
-                INSERT INTO latest_offers SELECT * FROM temp_prices
+                INSERT INTO latest_offers
+                SELECT DISTINCT ON (chain_product_id, store_id) * FROM temp_prices
+                ORDER BY chain_product_id, store_id, price_date DESC
                 ON CONFLICT (chain_product_id, store_id) DO UPDATE SET
                     price_date = EXCLUDED.price_date,
                     regular_price = EXCLUDED.regular_price,
@@ -894,6 +892,15 @@ class PostgresDatabase(Database):
                     AND ROW(latest_offers.*) IS DISTINCT FROM ROW(EXCLUDED.*)
                 """
             )
+            duplicates = {
+                (row["product_id"], row["store_id"])
+                for row in await conn.fetch(DUPLICATE_CANONICAL_OFFERS)
+            }
+            context = self._import_conn.get()
+            if context is None:
+                self._warn_duplicate_shops(duplicates)
+            else:
+                context.duplicate_shops.update(duplicates)
             await conn.execute("DROP TABLE temp_prices")
             _, _, rowcount = result.split(" ")
             rowcount = int(rowcount)
