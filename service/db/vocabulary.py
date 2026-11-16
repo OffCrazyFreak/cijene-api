@@ -4,6 +4,7 @@ from array import array
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
+from sys import intern
 
 from service.db.matching import (
     EDIT_MIN_LENGTH,
@@ -32,7 +33,7 @@ class VocabularyIndex:
 
     def __init__(self, rows: Iterable[CatalogueRow]):
         self.variants: list[Variant] = []
-        self.variant_words: list[tuple[list[str], list[str]]] = []
+        self.variant_words: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
         self.chain_products: list[array] = []
         self.known_brands: set[str] = set()
         self.postings: dict[str, array] = defaultdict(lambda: array("I"))
@@ -58,8 +59,9 @@ class VocabularyIndex:
         self.chain_products.append(array("q"))
 
         name, brand, _, _ = variant
-        words = normalize(name + " " + brand).split()
-        brand_words = normalize(brand).split()
+        # Interning shares one string per distinct word across all variants.
+        words = tuple(intern(word) for word in normalize(name + " " + brand).split())
+        brand_words = tuple(intern(word) for word in normalize(brand).split())
         self.variant_words.append((words, brand_words))
         for word in set(words):
             self.postings[word].append(variant_id)

@@ -2,6 +2,7 @@
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from decimal import Decimal
 
 INTENT_MODIFIERS = {
@@ -129,8 +130,8 @@ def relevance(
 
 def score_words(
     tokens: list[str],
-    words: list[str],
-    brand_words: list[str],
+    words: Sequence[str],
+    brand_words: Sequence[str],
     quantity: str | None = None,
     unit: str | None = None,
     known_brands: set[str] | None = None,
