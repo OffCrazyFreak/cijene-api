@@ -8,7 +8,7 @@ Latest v1 routes read one mutable table, `latest_offers`, joined to the mutable 
 
 `chain_import_dates` holds each chain's newest imported price date. An offer older than that date is a carried-forward observation, which search reports as `partial`.
 
-`import_state` is a single row with the import `epoch`, the transaction that last moved it and a `baseline_complete` marker. The epoch is the version that cursors and in-process search caches compare against.
+`import_state` is a single row with the import `epoch` and a `baseline_complete` marker. The epoch is the version that cursors and in-process search caches compare against.
 
 ## Imports
 
@@ -20,7 +20,9 @@ When two chain codes of one EAN have offers in the same shop (for example after 
 
 ## Epoch
 
-Statement-level triggers on `chains`, `stores`, `products`, `chain_products`, `latest_offers` and `chain_import_dates` move the epoch by one in any transaction whose statements insert, delete, truncate or actually change served rows. Each transaction moves it at most once. Updates that only stamp `metadata_source_date`, and identical replays, leave it alone. The triggers cover every write path: imports, enrichment, direct metadata updates and manual SQL.
+The service moves the epoch itself. Every write helper that touches `chains`, `stores`, `products`, `chain_products`, `latest_offers` or `chain_import_dates` reports how many rows it really changed; the upserts skip unchanged rows, so identical replays report none. Inside an import or metadata writer transaction the epoch moves once, just before commit, if any helper reported a change. A helper called on its own moves it in its own transaction. Stamping `metadata_source_date` never moves it. A `TRUNCATE` of a served table moves it through a plain statement trigger. Other manual SQL on served tables does not move the epoch, so run `UPDATE import_state SET epoch = epoch + 1` in the same transaction after such a change.
+
+The epoch used to come from statement triggers with transition tables. Inside one whole-archive import, PostgreSQL kept every statement's transition rows until commit, and the national 2026-11-14 archive drove the database backend past 2 GiB. Writes inside an import transaction also no longer open a savepoint per batch, because any error already rolls back the whole import.
 
 Readers open a `REPEATABLE READ` transaction, so a request sees one consistent snapshot of the catalogue, the offers and the epoch, and an import that commits during the request is invisible to it. A cursor issued under an older epoch is rejected with HTTP 409 `cursor_expired`, and the client restarts from page one.
 
@@ -36,4 +38,4 @@ There is no migration ledger: every startup reapplies 001 to 004. Migration 002 
 
 ## Verification
 
-Integration tests on disposable PostgreSQL 17 cover backfill, repeated and concurrent initialization, failed and cancelled backfill, full payload copy, correction, replay, failed imports, older archives, retained branches, duplicate chain codes, direct metadata updates, the epoch triggers and cleanup with retained latest offers. National-scale import time, disk use and latency remain unmeasured.
+Integration tests on disposable PostgreSQL 17 cover backfill, repeated and concurrent initialization, failed and cancelled backfill, full payload copy, correction, replay, failed imports, older archives, retained branches, duplicate chain codes, direct metadata updates, epoch moves without row-copying triggers or savepoints and cleanup with retained latest offers. National-scale import time, disk use and latency remain unmeasured.
