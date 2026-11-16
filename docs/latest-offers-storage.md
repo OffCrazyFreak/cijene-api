@@ -1,43 +1,37 @@
-# Immutable baseline storage
+# Latest offers storage
 
-This change adds storage for later publication work. Existing API queries and incoming imports still use the mutable legacy tables. The baseline is an upgrade snapshot, not the current response dataset. There is no publication, rollback command, generation-aware request adapter, ranking change or cursor support in this change. Do not deploy this intermediate storage change as a completed latest-price service.
+Latest v1 routes read one mutable table, `latest_offers`, joined to the mutable catalogue tables (`chains`, `stores`, `products`, `chain_products`). The dated `prices` table stays as history for the legacy v0 routes and statistics. An earlier design kept immutable generations, versions and membership rows for every import; migration 004 removes it because each daily import copied nearly every national offer while only about 0.8% of regular prices changed between two sampled days.
+
+## Tables
+
+`latest_offers` holds one row per chain product and store, keyed by `(chain_product_id, store_id)`, with the same observation columns as `prices`: price date, regular and special price, unit price, best price in 30 days, anchor price and date, availability and special sale type. A store id index serves store-scoped reads.
+
+`import_state` is a single row with the import `epoch`, the transaction that last moved it and a `baseline_complete` marker. The epoch is the version that cursors and in-process search caches compare against.
+
+## Imports
+
+An import runs in one serialized writer transaction (advisory lock 73198421). Each price batch is inserted into `prices` as before, and the same batch is upserted into `latest_offers`. The upsert replaces an existing offer only when the incoming price date is newer or equal, so same-date corrections replace and an older archive never overrides a newer offer. Unchanged rows are skipped. A shop that is missing from a newer file keeps its latest known offer with its own date; absence is not treated as removal and listing status stays `unknown`.
+
+Store and chain product upserts also skip unchanged rows. Newer metadata still wins over older imports: `metadata_source_date` on stores and chain products records the archive date that supplied them, and an older import restores newer metadata before it commits.
+
+When two chain codes of one EAN have offers in the same shop (for example after a chain moves an EAN to a new code), the import logs a warning with the number of affected shops and continues. Reads pick the offer with the newest price date, then the lowest chain product id.
+
+## Epoch
+
+Statement-level triggers on `chains`, `stores`, `products`, `chain_products` and `latest_offers` move the epoch by one in any transaction whose statements insert, delete or actually change served rows. Each transaction moves it at most once. Updates that only stamp `metadata_source_date`, and identical replays, leave it alone. The triggers cover every write path: imports, enrichment, direct metadata updates and manual SQL.
+
+Readers open a `REPEATABLE READ` transaction, so a request sees one consistent snapshot of the catalogue, the offers and the epoch, and an import that commits during the request is invisible to it. A cursor issued under an older epoch is rejected with HTTP 409 `cursor_expired`, and the client restarts from page one.
 
 ## Initialization
 
-`PostgresDatabase.create_tables()` obtains transaction advisory lock 73198421 before any schema operation. It reapplies the numbered SQL migrations in order and runs `backfill_legacy(conn)` in that same transaction. PostgreSQL 17 is the tested server version. There is no separate migration-version ledger.
+`PostgresDatabase.create_tables()` takes the writer lock, reapplies the schema and every numbered migration in order, then runs the one-time backfill in the same transaction. When `baseline_complete` is false, the backfill copies each chain product and store's latest dated row from `prices` into `latest_offers` and sets the marker. A fresh database sets the marker with nothing to copy. A failed or cancelled initialization rolls back the tables, the copy and the marker together, and concurrent initializations produce one copy.
 
-Stop every old service process, importer, enrichment worker and cleanup command before an actual upgrade. Old binaries do not share the new cleanup boundary. Initialization additionally takes table locks on legacy chains, products, stores, chain products and prices during the first snapshot. These locks protect the snapshot from already running legacy mutations; they cannot stop an old process restarting after the upgrade. An upgrade is an operator-controlled offline step, not an authorization to deploy.
+There is no migration ledger: every startup reapplies 001 to 004. Migration 002 therefore recreates the old generation tables and 004 drops them again on each start. This is harmless but wasteful; a ledger is a possible follow-up.
 
-A populated legacy database gets one accepted generation with origin `legacy`, no parent, no previous pointer and epoch 1. For each source chain-product/store identity, the greatest retained source date supplies its offer. A newer observation at another store cannot remove an older branch offer. Stable numeric IDs, source codes, global links, directory metadata, coordinates and every observation field remain in the snapshot. All metadata rows are retained, including rows with no latest offer. Users and API keys stay entirely outside publication storage.
+## Cleanup
 
-Legacy revision hashes and archive completeness are unknown. No source revision is invented. Each baseline offer has a NULL revision reference and unknown listing status. Existing overwritten corrections cannot be recovered; the snapshot records the retained corrected values and does not invent a previous good generation.
+`service.db.clean_prices` deletes dated `prices` rows older than the kept number of days again, since latest offers no longer depend on them. Each chain's latest date stays. Cleanup never touches `latest_offers`, so a shop's last known offer survives the deletion of its dated row. Cleanup holds a session writer lock across separate per-date transactions, keeps completed dates after an interruption and runs VACUUM after releasing the lock.
 
-An empty database marks baseline initialization complete without accepting a generation. Repeated startup checks that marker and avoids copying mutable imports received after initialization. A failed or cancelled initialization rolls back schema changes, versions, membership and the marker together. Concurrent initialization uses the same writer lock and produces at most one baseline.
+## Verification
 
-## Tables and invariants
-
-`generations` holds draft and accepted descriptors. `publication_state` holds the singleton active/previous pointers, epoch and baseline completion marker. Product, chain, store, chain-product and offer versions preserve typed values. Generation membership references stable IDs and immutable version IDs. Foreign keys keep referenced metadata in the same generation; acceptance validates membership links and store/chain-product chain identity. Versions are independent of mutable legacy rows.
-
-Membership edits lock referenced generation rows before checking acceptance, so a concurrent acceptance cannot commit ahead of a pending edit. Accepted generations and their membership cannot be updated, deleted or truncated. Version rows and source revision manifests cannot be updated, deleted or truncated. New draft versions can be inserted for future publication. This uses application-owned tables and triggers, not a security boundary against a database owner who disables triggers.
-
-`generation_stats` rebuilds latest per-chain-product count, exact minimum/maximum/average effective price and minimum/maximum observation dates from the mixed-date offer membership. Effective price uses the lower supplied regular or special price, preserving valid zero prices and the existing lower-price rule. A missing special price uses the regular price. Existing historical aggregate tables remain unchanged. `source_revisions` reserves nullable provenance fields; `generation_retention_holds` reserves references for later cursor retention. Physical reclamation is disabled and no retention duration is selected.
-
-The one-time baseline copies retained metadata and one latest offer per identity. Later publication must reuse immutable versions where values and provenance are unchanged. The small integration fixture measures relation/index size and member counts only; it establishes no national disk, latency or concurrency capacity.
-
-## Transactions and cleanup
-
-Imports and cleanup coordinate through the same advisory writer lock. Imports and cleanup counts use read-committed transactions. Destructive cleanup holds a session lock across separate per-date transactions, retaining completed dates after an interruption. The session lock is released in `finally`, including cancellation while waiting for or holding it. A transaction connection belongs to its creating asyncio task. Database calls made by an inherited child context fail before SQL, including children released after the parent exits. Independent tasks acquire independent pooled connections. Nested writer modes fail. Context tokens reset in `finally`, including cancellation. Importers remain sequential.
-
-Cleanup holds the lock from protection calculation through all date deletions. Each date commits independently, and VACUUM runs after the lock is released. With any accepted generation, direct deletion and the CLI fail clearly. Direct counts return an empty deletion plan with a protected-state warning; CLI dry-run reports that all prices are protected. The database rechecks protection under the lock even after the CLI check, preventing an initialization race. No dry-run reports rows as deletable when generation retention forbids deletion.
-
-## Verification and later work
-
-Integration tests use disposable PostgreSQL 17 and cover fresh/legacy/repeated/concurrent initialization, failed and cancelled backfill, full payload preservation, inherited connections, cancellation reset, independent reader visibility, writer locking and import/cleanup ordering. Existing importer and HTTP tests remain the compatibility guard.
-
-Incoming publication, active/previous transitions, rollback, generation-aware reads, complete search and pagination remain later work. Before changing read semantics, publish writers and read adapters together and validate generation retention dependencies. Downgrading to old mutable readers after publication is enabled is unsupported; use a reviewed recovery procedure rather than silently starting an older binary.
-
-## Incoming publication
-
-Validated imports now publish inside the serialized writer transaction. Immutable version rows are reused when their complete payload is unchanged; each generation records membership for the latest observation of every source product/shop identity. The active and previous pointers change only after acceptance. Empty initialization is handled explicitly on the first non-empty import. Identical replay retains the current generation. Enrichment CLI work uses the same publication transaction, while direct accepted-metadata updates require that boundary. Legacy statistics updates do not affect latest reads.
-
-Latest v1 product, directory, price and statistics routes read immutable members. Product pages retain their generation in validated cursors. See [latest search](search.md) for filters, ordering, response additions and verification limits. Rollback commands and physical reclamation remain deferred.
+Integration tests on disposable PostgreSQL 17 cover backfill, repeated and concurrent initialization, failed and cancelled backfill, full payload copy, correction, replay, failed imports, older archives, retained branches, duplicate chain codes, direct metadata updates, the epoch triggers and cleanup with retained latest offers. National-scale import time, disk use and latency remain unmeasured.
