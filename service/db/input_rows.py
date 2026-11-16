@@ -117,18 +117,27 @@ def iter_rows(path: Path) -> Iterator[dict[str, str]]:
 
 
 def remember(index: sqlite3.Connection, kind: str, key: str, row: dict) -> bool:
+    """True for the first row of a key; raises when a repeated row differs."""
     payload = json.dumps(row, sort_keys=True)
+    if index.execute(
+        "INSERT OR IGNORE INTO entries VALUES (?,?,?)", (kind, key, payload)
+    ).rowcount:
+        return True
     previous = index.execute(
         "SELECT payload FROM entries WHERE kind=? AND key=?", (kind, key)
-    ).fetchone()
-    if previous:
-        if previous[0] != payload:
-            raise ValueError("Conflicting duplicate source row")
-        return False
-    index.execute(
-        "INSERT INTO entries(kind,key,payload) VALUES (?,?,?)", (kind, key, payload)
+    ).fetchone()[0]
+    if previous != payload:
+        raise ValueError("Conflicting duplicate source row")
+    return False
+
+
+def remember_first(index: sqlite3.Connection, key: str, row: dict) -> bool:
+    return bool(
+        index.execute(
+            "INSERT OR IGNORE INTO entries VALUES ('prices',?,?)",
+            (key, json.dumps(row, sort_keys=True)),
+        ).rowcount
     )
-    return True
 
 
 def merge_offer(kept: dict, row: dict) -> dict | None:
@@ -142,43 +151,65 @@ def merge_offer(kept: dict, row: dict) -> dict | None:
     return kept
 
 
-def remember_offer(index: sqlite3.Connection, key: str, row: dict) -> None:
-    previous = index.execute(
-        "SELECT payload,skipped FROM entries WHERE kind='prices' AND key=?", (key,)
-    ).fetchone()
-    if previous is None:
-        remember(index, "prices", key, row)
-        return
+class RepeatedOffers:
+    """Resolution of price keys that one chain file lists more than once."""
 
-    payload, skipped = previous
-    if skipped:
-        return
-    merged = merge_offer(json.loads(payload), row)
-    if merged is None:
-        index.execute(
-            "UPDATE entries SET skipped=1 WHERE kind='prices' AND key=?", (key,)
-        )
-    else:
-        index.execute(
-            "UPDATE entries SET payload=? WHERE kind='prices' AND key=?",
-            (json.dumps(merged, sort_keys=True), key),
-        )
+    def __init__(self) -> None:
+        self.resolved: dict[str, dict | None] = {}
+        self.merged: set[str] = set()
 
+    def add(self, index: sqlite3.Connection, key: str, row: dict) -> None:
+        current = self.resolved.get(key)
+        if key not in self.resolved:
+            current = json.loads(
+                index.execute(
+                    "SELECT payload FROM entries WHERE kind='prices' AND key=?", (key,)
+                ).fetchone()[0]
+            )
+        if current is None:
+            return
 
-def write_offers(index: sqlite3.Connection, writer: csv.DictWriter, chain: str) -> None:
-    for (payload,) in index.execute(
-        "SELECT payload FROM entries WHERE kind='prices' AND NOT skipped ORDER BY rowid"
-    ):
-        writer.writerow(json.loads(payload))
+        merged = merge_offer(current, row)
+        if merged is current:
+            return
+        self.resolved[key] = merged
+        if merged is None:
+            self.merged.discard(key)
+        else:
+            self.merged.add(key)
 
-    skipped = index.execute(
-        "SELECT count(*) FROM entries WHERE kind='prices' AND skipped"
-    ).fetchone()[0]
-    if skipped:
+    def apply(self, prices: Path, chain: str) -> None:
+        """Rewrite the snapshot's first occurrences with each key's resolution."""
+        if not self.resolved:
+            return
+
+        rewritten = prices.with_suffix(".resolved")
+        with (
+            prices.open(encoding="utf-8", newline="") as source,
+            rewritten.open("w", encoding="utf-8", newline="") as output,
+        ):
+            reader = csv.DictReader(source)
+            writer = csv.DictWriter(output, fieldnames=list(reader.fieldnames or []))
+            writer.writeheader()
+            for row in reader:
+                key = offer_key(row)
+                if key in self.resolved:
+                    resolution = self.resolved[key]
+                    if resolution is None:
+                        continue
+                    row = resolution
+                writer.writerow(row)
+        rewritten.replace(prices)
+
+        skipped = sum(resolution is None for resolution in self.resolved.values())
         logger.warning(
-            f"{chain}: skipped {skipped:,} product and shop pairs whose rows "
-            "for one date conflict"
+            f"{chain}: merged {len(self.merged):,} and skipped {skipped:,} "
+            "product and shop pairs with repeated rows for one date"
         )
+
+
+def offer_key(row: dict) -> str:
+    return json.dumps([row["product_id"], row["store_id"]])
 
 
 def prepare_input(path: Path, destination: Path) -> None:
@@ -195,9 +226,12 @@ def prepare_input(path: Path, destination: Path) -> None:
         raise ValueError("Input must contain bounded chain directories")
     total = 0
     with closing(sqlite3.connect(destination / "validation.sqlite")) as index, index:
+        # The index is private scratch data, so crash safety buys nothing here.
+        index.execute("PRAGMA journal_mode=OFF")
+        index.execute("PRAGMA synchronous=OFF")
+        index.execute("PRAGMA cache_size=-131072")
         index.execute(
-            "CREATE TABLE entries (kind TEXT, key TEXT, payload TEXT, "
-            "skipped INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(kind,key))"
+            "CREATE TABLE entries (kind TEXT, key TEXT, payload TEXT, PRIMARY KEY(kind,key))"
         )
         for chain in chains:
             if chain.is_symlink() or not chain.is_dir() or len(chain.name) > 50:
@@ -205,6 +239,8 @@ def prepare_input(path: Path, destination: Path) -> None:
             target = destination / chain.name
             target.mkdir()
             index.execute("DELETE FROM entries")
+            known: dict[str, set[str]] = {"stores": set(), "products": set()}
+            repeated = RepeatedOffers()
             for kind in REQUIRED:
                 source = chain / f"{kind}.csv"
                 try:
@@ -248,22 +284,15 @@ def prepare_input(path: Path, destination: Path) -> None:
                             if not row["name"].strip():
                                 raise ValueError("Missing product name")
                         else:
-                            key = json.dumps([row["product_id"], row["store_id"]])
+                            key = offer_key(row)
                             limits = {}
                             for field in MONEY_FIELDS:
                                 parse_money(row.get(field, ""), field == "price")
-                            for ref_kind, ref in [
-                                ("stores", row["store_id"]),
-                                ("products", row["product_id"]),
-                            ]:
-                                if (
-                                    index.execute(
-                                        "SELECT 1 FROM entries WHERE kind=? AND key=?",
-                                        (ref_kind, ref),
-                                    ).fetchone()
-                                    is None
-                                ):
-                                    raise ValueError("Missing source reference")
+                            if (
+                                row["store_id"] not in known["stores"]
+                                or row["product_id"] not in known["products"]
+                            ):
+                                raise ValueError("Missing source reference")
                             availability(row.get("available", ""))
                             if row.get("anchor_price_date"):
                                 source_date(row["anchor_price_date"])
@@ -274,17 +303,19 @@ def prepare_input(path: Path, destination: Path) -> None:
                             for field, limit in limits.items()
                         ):
                             raise ValueError("Missing identity or oversized metadata")
-                        # Owner rule: rows of one code, shop and date differing beyond unit price are skipped.
                         if kind == "prices":
-                            remember_offer(index, key, row)
-                            continue
-                        # Two product codes of one barcode in a shop are kept; reads pick one.
-                        if not remember(index, kind, key, row):
-                            continue
+                            # Owner rule: repeated rows merge on unit price, else the pair is skipped.
+                            if not remember_first(index, key, row):
+                                repeated.add(index, key, row)
+                                continue
+                        else:
+                            known[kind].add(key)
+                            # Two product codes of one barcode in a shop are kept; reads pick one.
+                            if not remember(index, kind, key, row):
+                                continue
                         writer.writerow(row)
-                    if kind == "prices" and writer is not None:
-                        write_offers(index, writer, chain.name)
                     if writer is None:
                         with source.open(encoding="utf-8", newline="") as original:
                             headers = next(csv.reader(original))
                         csv.writer(output).writerow(headers)
+            repeated.apply(target / "prices.csv", chain.name)

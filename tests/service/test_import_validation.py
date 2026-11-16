@@ -97,7 +97,7 @@ async def fetch_all(db, query):
         return [tuple(row) for row in await conn.fetch(query)]
 
 
-def test_rows_differing_only_in_unit_price_merge(database, tmp_path):
+def test_rows_differing_only_in_unit_price_merge(database, tmp_path, caplog):
     async def run():
         async with database() as db:
             await db.create_tables()
@@ -127,6 +127,7 @@ def test_rows_differing_only_in_unit_price_merge(database, tmp_path):
                 "SELECT cp.code,p.unit_price FROM prices p JOIN chain_products cp ON cp.id=p.chain_product_id ORDER BY cp.code",
             )
             assert rows == [("001", None), ("002", Decimal("0.50"))]
+            assert "test: merged 1 and skipped 0 product and shop pairs" in caplog.text
 
     asyncio.run(run())
 
@@ -166,8 +167,8 @@ def test_conflicting_rows_skip_only_that_shop_and_day(database, tmp_path, caplog
             with patch.object(importer, "db", db):
                 await importer.import_directory(day, False)
 
-            assert "other: skipped 2 product and shop pairs" in caplog.text
-            assert "test: skipped 1 product and shop pairs" in caplog.text
+            assert "other: merged 0 and skipped 2 product and shop pairs" in caplog.text
+            assert "test: merged 0 and skipped 1 product and shop pairs" in caplog.text
             offers = await fetch_all(
                 db,
                 "SELECT c.code,cp.code,o.price_date::text,o.regular_price FROM latest_offers o JOIN chain_products cp ON cp.id=o.chain_product_id JOIN chains c ON c.id=cp.chain_id ORDER BY 1,2",
