@@ -165,9 +165,6 @@ def score_words(
 ) -> tuple[int, int] | None:
     """relevance() over already normalized query tokens and name and brand words."""
     words = list(words)
-    requested_brands = (known_brands or set()) & set(tokens)
-    if requested_brands and not requested_brands <= set(brand_words):
-        return None
     pairs = pack_pairs(tokens)
     packs = pack_sizes(words, quantity, unit) if pairs else []
     for index in pairs:
